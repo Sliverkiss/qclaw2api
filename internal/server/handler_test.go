@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"qclaw2api/internal/auth"
-	"qclaw2api/internal/jprx"
 	"qclaw2api/internal/pool"
 	"qclaw2api/internal/upstream"
 )
@@ -49,38 +50,28 @@ func (f *fakeAizone) handler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(f.body))
 }
 
-// fakeJPRX 假 jprx 网关（模型列表）。
-type fakeJPRX struct {
-	mu     sync.Mutex
-	models []string
-}
-
-func (f *fakeJPRX) handler(w http.ResponseWriter, r *http.Request) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	items := []map[string]any{}
-	for _, m := range f.models {
-		items = append(items, map[string]any{"id": m, "name": m})
+// writeModelsFile 写测试 models.json（OpenAI /v1/models 形状）。
+func writeModelsFile(t *testing.T, ids ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "models.json")
+	data := make([]map[string]any, 0, len(ids))
+	for _, id := range ids {
+		data = append(data, map[string]any{"id": id, "object": "model", "created": 1753600000, "owned_by": "qclaw"})
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"ret": 0,
-		"data": map[string]any{
-			"resp": map[string]any{
-				"common": map[string]any{"code": 0},
-				"data":   map[string]any{"model_status_list": items},
-			},
-		},
-	})
+	raw, _ := json.Marshal(map[string]any{"object": "list", "data": data})
+	if err := os.WriteFile(fp, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return fp
 }
 
-// newTestHandler 组装 handler：pool + aizone 假上游 + jprx 假网关。
-func newTestHandler(t *testing.T, aiz *fakeAizone, j *fakeJPRX) (*Handler, *pool.Pool) {
+// newTestHandler 组装 handler：pool + aizone 假上游 + models 文件。
+// modelsFile 为空则用默认（无文件 → 回退 staticModels）。
+func newTestHandler(t *testing.T, aiz *fakeAizone, modelsFile string) (*Handler, *pool.Pool) {
 	t.Helper()
 	aizSrv := httptest.NewServer(http.HandlerFunc(aiz.handler))
 	t.Cleanup(aizSrv.Close)
-	jSrv := httptest.NewServer(http.HandlerFunc(j.handler))
-	t.Cleanup(jSrv.Close)
 
 	p := pool.New("", pool.Config{RPM: 60, ErrThreshold: 5, ErrCooldown: 10 * time.Minute})
 	p.Add(mkAuth("1"))
@@ -89,20 +80,15 @@ func newTestHandler(t *testing.T, aiz *fakeAizone, j *fakeJPRX) (*Handler, *pool
 	up := upstream.New()
 	up.SetChatURL(aizSrv.URL + "/aizone/v1/chat/completions")
 
-	jc := jprx.New()
-	jc.SetBase(jSrv.URL)
-
 	return NewHandler(Config{
 		Pool:         p,
 		Upstream:     up,
-		JPRX:         jc,
+		ModelsFile:   modelsFile,
 		APIKey:       testAPIKey,
 		MaxRotate:    3,
-		HardCooldown: 12 * time.Hour,
 		SoftCooldown: 60 * time.Second,
 		ErrThreshold: 5,
 		ErrCooldown:  10 * time.Minute,
-		RefreshSkew:  7 * 24 * time.Hour,
 	}), p
 }
 
@@ -110,7 +96,7 @@ func newTestHandler(t *testing.T, aiz *fakeAizone, j *fakeJPRX) (*Handler, *pool
 func TestAuth(t *testing.T) {
 	body := `data: {"id":"x","choices":[{"delta":{"content":"hi"}}]}` + "\n\ndata: [DONE]\n\n"
 	aiz := &fakeAizone{status: 200, body: body}
-	h, _ := newTestHandler(t, aiz, &fakeJPRX{models: []string{"default"}})
+	h, _ := newTestHandler(t, aiz, writeModelsFile(t, "default"))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
@@ -141,7 +127,7 @@ func TestAuth(t *testing.T) {
 func TestChatAggregate(t *testing.T) {
 	body := `data: {"id":"msg-1","model":"m","choices":[{"delta":{"content":"你好"}}]}` + "\n\ndata: [DONE]\n\n"
 	aiz := &fakeAizone{status: 200, body: body}
-	h, _ := newTestHandler(t, aiz, &fakeJPRX{models: []string{"default"}})
+	h, _ := newTestHandler(t, aiz, writeModelsFile(t, "default"))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
@@ -170,7 +156,7 @@ func TestChatAggregate(t *testing.T) {
 func TestChatStream(t *testing.T) {
 	body := `data: {"id":"x","choices":[{"delta":{"content":"hi"}}]}` + "\n\ndata: [DONE]\n\n"
 	aiz := &fakeAizone{status: 200, body: body}
-	h, _ := newTestHandler(t, aiz, &fakeJPRX{models: []string{"default"}})
+	h, _ := newTestHandler(t, aiz, writeModelsFile(t, "default"))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
@@ -214,9 +200,8 @@ func TestChatRotateOnServerError(t *testing.T) {
 
 	up := upstream.New()
 	up.SetChatURL(aizSrv.URL + "/chat")
-	jc := jprx.New()
 
-	h := NewHandler(Config{Pool: p, Upstream: up, JPRX: jc, APIKey: testAPIKey, MaxRotate: 3})
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: testAPIKey, MaxRotate: 3})
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
@@ -235,10 +220,10 @@ func TestChatRotateOnServerError(t *testing.T) {
 	}
 }
 
-// TestModels 校验 /v1/models 动态列表（经 4320 假网关）。
+// TestModels 校验 /v1/models 读 models.json 文件。
 func TestModels(t *testing.T) {
 	aiz := &fakeAizone{status: 200, body: ""}
-	h, _ := newTestHandler(t, aiz, &fakeJPRX{models: []string{"default", "pool-deepseek-v4-flash"}})
+	h, _ := newTestHandler(t, aiz, writeModelsFile(t, "default", "pool-deepseek-v4-flash"))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
@@ -260,11 +245,10 @@ func TestModels(t *testing.T) {
 	}
 }
 
-// TestModelsStaticFallback 校验 4320 失败/无账号时回退静态表。
+// TestModelsStaticFallback 校验无 models.json 文件时回退静态表。
 func TestModelsStaticFallback(t *testing.T) {
 	aiz := &fakeAizone{status: 200, body: ""}
-	j := &fakeJPRX{models: []string{}}
-	h, _ := newTestHandler(t, aiz, j)
+	h, _ := newTestHandler(t, aiz, "") // ModelsFile 空 → staticModels
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
@@ -289,7 +273,7 @@ func TestModelsStaticFallback(t *testing.T) {
 // TestStatus 校验 /status 返回账号列表。
 func TestStatus(t *testing.T) {
 	aiz := &fakeAizone{status: 200, body: ""}
-	h, _ := newTestHandler(t, aiz, &fakeJPRX{models: []string{"default"}})
+	h, _ := newTestHandler(t, aiz, writeModelsFile(t, "default"))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
@@ -314,7 +298,7 @@ func TestStatus(t *testing.T) {
 // TestHealthz 校验免鉴权 healthz。
 func TestHealthz(t *testing.T) {
 	aiz := &fakeAizone{status: 200, body: ""}
-	h, _ := newTestHandler(t, aiz, &fakeJPRX{models: []string{"default"}})
+	h, _ := newTestHandler(t, aiz, writeModelsFile(t, "default"))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
@@ -331,7 +315,7 @@ func TestHealthz(t *testing.T) {
 // TestEmbeddingsNotFound 校验 embeddings 404。
 func TestEmbeddingsNotFound(t *testing.T) {
 	aiz := &fakeAizone{status: 200, body: ""}
-	h, _ := newTestHandler(t, aiz, &fakeJPRX{models: []string{"default"}})
+	h, _ := newTestHandler(t, aiz, writeModelsFile(t, "default"))
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
@@ -352,7 +336,7 @@ func TestEmbeddingsNotFound(t *testing.T) {
 // chatHTTP.Do 立即返回 context.Canceled → handler 应直接 return，不 NoteError、不冷却账号。
 func TestChatClientDisconnectNotCounted(t *testing.T) {
 	aiz := &fakeAizone{status: 200, body: ""}
-	h, p := newTestHandler(t, aiz, &fakeJPRX{models: []string{"default"}})
+	h, p := newTestHandler(t, aiz, writeModelsFile(t, "default"))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // 请求 ctx 已取消（模拟客户端已断开）

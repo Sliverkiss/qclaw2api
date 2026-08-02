@@ -17,8 +17,9 @@ import (
 
 // Client 是 jprx 网关客户端。
 type Client struct {
-	HTTP *http.Client
-	base string
+	HTTP         *http.Client
+	base         string
+	captureToken bool // X-New-Token 捕获开关：仅登录链路开启
 }
 
 // New 创建默认 jprx 客户端。
@@ -31,6 +32,9 @@ func New() *Client {
 
 // SetBase 覆盖网关基址（测试注入 httptest server 用）。
 func (c *Client) SetBase(base string) { c.base = base }
+
+// SetCaptureNewToken 开启/关闭 X-New-Token 捕获（仅登录链路开启，运行期不捕获）。
+func (c *Client) SetCaptureNewToken(on bool) { c.captureToken = on }
 
 // JPRXError 是信封 code 非 0 时的业务错误。
 type JPRXError struct {
@@ -205,13 +209,15 @@ func (c *Client) exec(ctx context.Context, cmd string, body []byte, acct *auth.A
 	raw, h, err := c.doForward(ctx, path, body, acct)
 	if err != nil {
 		// HTTP 层失败也尝试捕获 X-New-Token（部分网关错误仍带续期头）
-		if h != nil {
+		if c.captureToken && h != nil {
 			_ = captureNewToken(h, acct)
 		}
 		return nil, err
 	}
-	if err := captureNewToken(h, acct); err != nil {
-		return nil, fmt.Errorf("jprx %s capture token: %w", cmd, err)
+	if c.captureToken {
+		if err := captureNewToken(h, acct); err != nil {
+			return nil, fmt.Errorf("jprx %s capture token: %w", cmd, err)
+		}
 	}
 	code, payload, msg, err := parseEnvelope(raw)
 	if err != nil {
@@ -388,19 +394,6 @@ func (c *Client) GetUsage(ctx context.Context, acct *auth.Auth, start, end strin
 	return c.exec(ctx, "4172", body, acct, false)
 }
 
-// RefreshChannelToken 4058：幂等刷新 channel token（X-New-Token 由 exec 捕获）。
-func (c *Client) RefreshChannelToken(ctx context.Context, acct *auth.Auth) error {
-	payload, err := c.exec(ctx, "4058", []byte(`{}`), acct, false)
-	if err != nil {
-		return err
-	}
-	// 幂等返回同一 channel token；此处仅校验信封正常。
-	if len(bytes.TrimSpace(payload)) == 0 {
-		return fmt.Errorf("4058: empty payload")
-	}
-	return nil
-}
-
 // ModelStatus 4320 模型列表。
 type ModelStatus struct {
 	ModelStatusList []ModelInfo `json:"model_status_list"`
@@ -424,27 +417,6 @@ func (c *Client) GetModelStatus(ctx context.Context, acct *auth.Auth) (*ModelSta
 	}
 	if len(r.ModelStatusList) == 0 {
 		return nil, fmt.Errorf("4320: empty model_status_list")
-	}
-	return &r, nil
-}
-
-// ImageResult 4299 生图结果。
-type ImageResult struct {
-	Status    string `json:"status"`
-	ImageURL  string `json:"image_url"`
-	RequestID string `json:"request_id"`
-}
-
-// GenerateImage 4299：提交/轮询生图（轮询 = 重放同一 prompt，SPEC §3.6）。
-func (c *Client) GenerateImage(ctx context.Context, acct *auth.Auth, prompt string) (*ImageResult, error) {
-	body, _ := json.Marshal(map[string]string{"prompt": prompt})
-	payload, err := c.exec(ctx, "4299", body, acct, false)
-	if err != nil {
-		return nil, err
-	}
-	var r ImageResult
-	if err := json.Unmarshal(payload, &r); err != nil {
-		return nil, fmt.Errorf("4299: parse: %w", err)
 	}
 	return &r, nil
 }

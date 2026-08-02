@@ -176,7 +176,8 @@ func TestClassify(t *testing.T) {
 		want   ErrKind
 	}{
 		{401, `{"error":"invalid_api_key"}`, ErrSessionDead},
-		{403, `{"error":"api_key_inactive"}`, ErrHardCredit},
+		{403, `{"error":"api_key_inactive"}`, ErrInactive},
+		{403, `{"error":"insufficient credit"}`, ErrHardCredit},
 		{429, `{"error":"rate limited"}`, ErrSoftRate},
 		{500, `internal error`, ErrServer},
 		{400, `invalid request`, ErrClient},

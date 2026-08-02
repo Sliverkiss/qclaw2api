@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"qclaw2api/internal/auth"
-	"qclaw2api/internal/jprx"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长（SPEC §5）。
@@ -21,7 +20,8 @@ type ErrKind int
 
 const (
 	ErrNone        ErrKind = iota // 成功
-	ErrHardCredit                 // 403 api_key_inactive / 余额类 → 长冷却
+	ErrHardCredit                 // 余额/积分不足 → 下月1号冷却
+	ErrInactive                   // api_key_inactive 账号未激活 → 短冷却
 	ErrSoftRate                   // 429 → 短冷却
 	ErrSessionDead                // aizone 401 invalid_api_key / jprx 21004 → 禁用
 	ErrServer                     // 5xx → 换号重试
@@ -32,6 +32,8 @@ func (k ErrKind) String() string {
 	switch k {
 	case ErrHardCredit:
 		return "hard_credit"
+	case ErrInactive:
+		return "inactive"
 	case ErrSoftRate:
 		return "soft_rate"
 	case ErrSessionDead:
@@ -56,22 +58,30 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("upstream %s (http %d): %s", e.Kind, e.Status, e.Msg)
 }
 
-// hardMarkers 余额/激活类错误关键词（小写比较）。
-var hardMarkers = []string{
-	"api_key_inactive",
+// balanceMarkers 积分不足类关键词 → ErrHardCredit（下月1号恢复，keepalive 探测解冻）。
+var balanceMarkers = []string{
 	"insufficient credit", "no credit", "credit exhausted", "out of credit",
 	"quota exceeded", "payment required", "credit not enough",
 	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽",
 }
 
+// inactiveMarkers 账号未激活类关键词 → ErrInactive（固定短冷却，非余额问题）。
+var inactiveMarkers = []string{"api_key_inactive"}
+
 var sessionDeadMarkers = []string{"invalid_api_key", "21004", "登录已过期"}
 
-// Classify 按 HTTP 状态码 + body 判定错误类别（SPEC §5）。
+// Classify 按 HTTP 状态码 + body 判定错误类别（SPEC §2.3）。
+// 顺序：balanceMarkers → inactiveMarkers → sessionDeadMarkers → 429 → 5xx → 其余 4xx。
 func Classify(status int, body string) ErrKind {
 	lower := strings.ToLower(body)
-	for _, m := range hardMarkers {
+	for _, m := range balanceMarkers {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
 			return ErrHardCredit
+		}
+	}
+	for _, m := range inactiveMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
+			return ErrInactive
 		}
 	}
 	for _, m := range sessionDeadMarkers {
@@ -93,12 +103,11 @@ func Classify(status int, body string) ErrKind {
 
 // Client 对话上游 HTTP 客户端。
 type Client struct {
-	// HTTP 非对话路径（生图/通用），main 可带总超时。
+	// HTTP 通用路径，main 可带总超时。
 	HTTP *http.Client
 	// chatHTTP 对话流式专用：仅 ResponseHeaderTimeout，无总超时（防 Client.Timeout 掐流式）。
 	chatHTTP *http.Client
 	chatURL  string
-	jprx     *jprx.Client // 生图 4299 用（可注入测试）
 }
 
 // New 创建 aizone 上游客户端。
@@ -112,7 +121,6 @@ func New() *Client {
 		HTTP:     &http.Client{Transport: tr},
 		chatHTTP: &http.Client{Transport: tr},
 		chatURL:  "https://mmgrcalltoken.3g.qq.com/aizone/v1/chat/completions",
-		jprx:     jprx.New(),
 	}
 }
 

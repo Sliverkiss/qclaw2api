@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"qclaw2api/internal/auth"
-	"qclaw2api/internal/jprx"
 	"qclaw2api/internal/pool"
 	"qclaw2api/internal/scheduler"
 	"qclaw2api/internal/server"
@@ -65,17 +64,10 @@ func main() {
 		p.Add(a)
 	}
 
-	// jprx 客户端
-	jc := jprx.New()
-
 	// aizone 上游（对话走 ResponseHeaderTimeout，其余走 Timeout）
 	up := upstream.New()
 	up.SetResponseHeaderTimeout(time.Duration(cfg.Upstream.ResponseHeaderTimeoutSeconds) * time.Second)
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
-	up.SetImageConfig(upstream.ImageConfig{
-		PollInterval: time.Duration(cfg.Image.PollIntervalSeconds) * time.Second,
-		PollTimeout:  time.Duration(cfg.Image.PollTimeoutSeconds) * time.Second,
-	})
 
 	// scheduler：每日冷却恢复探测（对冷却中账号发 max_tokens=1 最小对话测试）
 	sch := scheduler.New(scheduler.Config{
@@ -103,14 +95,12 @@ func main() {
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
-		JPRX:         jc,
+		ModelsFile:   cfg.ModelsFile,
 		APIKey:       cfg.APIKey,
 		MaxRotate:    3,
-		HardCooldown: cfg.HardCreditDur,
 		SoftCooldown: cfg.SoftRateDur,
 		ErrThreshold: cfg.Cooldown.ErrThresh,
 		ErrCooldown:  cfg.ErrCooldownDur,
-		RefreshSkew:  cfg.RefreshSkew,
 		// 非流式聚合总超时与其余请求一致（P1-5）
 		AggregateTimeout: time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second,
 	})

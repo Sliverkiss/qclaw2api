@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// TestDefault 校验默认值符合 SPEC §3.8。
+// TestDefault 校验默认值符合 SPEC §2.9。
 func TestDefault(t *testing.T) {
 	c := Default()
 	if c.Listen != ":7865" {
@@ -16,20 +16,14 @@ func TestDefault(t *testing.T) {
 	if c.Cooldown.ErrThresh != 5 {
 		t.Errorf("ErrThresh = %d, want 5", c.Cooldown.ErrThresh)
 	}
-	if c.Schedule.CreditIntervalHours != 6 {
-		t.Errorf("CreditIntervalHours = %d, want 6", c.Schedule.CreditIntervalHours)
-	}
 	if len(c.Schedule.KeepaliveHours) != 1 || c.Schedule.KeepaliveHours[0] != 4 {
 		t.Errorf("KeepaliveHours = %v, want [4]", c.Schedule.KeepaliveHours)
 	}
 	if c.Upstream.ResponseHeaderTimeoutSeconds != 30 {
 		t.Errorf("ResponseHeaderTimeoutSeconds = %d, want 30", c.Upstream.ResponseHeaderTimeoutSeconds)
 	}
-	if c.Image.PollIntervalSeconds != 3 || c.Image.PollTimeoutSeconds != 120 {
-		t.Errorf("Image poll = %d/%d, want 3/120", c.Image.PollIntervalSeconds, c.Image.PollTimeoutSeconds)
-	}
-	if c.Refresh.SkewDays != 7 {
-		t.Errorf("Refresh.SkewDays = %d, want 7", c.Refresh.SkewDays)
+	if c.ModelsFile != "./data/models.json" {
+		t.Errorf("ModelsFile = %q, want ./data/models.json", c.ModelsFile)
 	}
 }
 
@@ -38,16 +32,15 @@ func TestLoadFromFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.json")
 	raw := `{
-  "listen": ":9999",
-  "api_key": "test-key",
-  "auth_dir": "/tmp/auths",
-  "state_file": "/tmp/state.json",
-  "cooldown": {"hard_credit": "1h", "soft_rate": "5s", "err_threshold": 2, "err_cooldown": "1m"},
-  "schedule": {"keepalive_hours": [4, 16], "credit_interval_hours": 3},
-  "upstream": {"response_header_timeout_seconds": 15, "timeout_seconds": 60},
-  "image": {"poll_interval_seconds": 5, "poll_timeout_seconds": 90},
-  "refresh": {"skew_days": 3}
-}`
+	  "listen": ":9999",
+	  "api_key": "test-key",
+	  "auth_dir": "/tmp/auths",
+	  "state_file": "/tmp/state.json",
+	  "models_file": "/tmp/models.json",
+	  "cooldown": {"soft_rate": "5s", "err_threshold": 2, "err_cooldown": "1m"},
+	  "schedule": {"keepalive_hours": [4, 16]},
+	  "upstream": {"response_header_timeout_seconds": 15, "timeout_seconds": 60}
+	}`
 	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -61,9 +54,6 @@ func TestLoadFromFile(t *testing.T) {
 	if c.APIKey != "test-key" {
 		t.Errorf("APIKey = %q", c.APIKey)
 	}
-	if c.HardCreditDur != time.Hour {
-		t.Errorf("HardCreditDur = %v", c.HardCreditDur)
-	}
 	if c.SoftRateDur != 5*time.Second {
 		t.Errorf("SoftRateDur = %v", c.SoftRateDur)
 	}
@@ -73,17 +63,11 @@ func TestLoadFromFile(t *testing.T) {
 	if len(c.Schedule.KeepaliveHours) != 2 || c.Schedule.KeepaliveHours[1] != 16 {
 		t.Errorf("KeepaliveHours = %v", c.Schedule.KeepaliveHours)
 	}
-	if c.Schedule.CreditIntervalHours != 3 {
-		t.Errorf("CreditIntervalHours = %d", c.Schedule.CreditIntervalHours)
-	}
 	if c.Upstream.ResponseHeaderTimeoutSeconds != 15 || c.Upstream.TimeoutSeconds != 60 {
 		t.Errorf("upstream = %d/%d", c.Upstream.ResponseHeaderTimeoutSeconds, c.Upstream.TimeoutSeconds)
 	}
-	if c.Image.PollIntervalSeconds != 5 || c.Image.PollTimeoutSeconds != 90 {
-		t.Errorf("image = %d/%d", c.Image.PollIntervalSeconds, c.Image.PollTimeoutSeconds)
-	}
-	if c.RefreshSkew != 3*24*time.Hour {
-		t.Errorf("RefreshSkew = %v", c.RefreshSkew)
+	if c.ModelsFile != "/tmp/models.json" {
+		t.Errorf("ModelsFile = %q", c.ModelsFile)
 	}
 }
 
@@ -92,13 +76,11 @@ func TestLoadEnvOverride(t *testing.T) {
 	os.Setenv("QC2A_API_KEY", "env-key")
 	os.Setenv("QC2A_LISTEN", "127.0.0.1:7000")
 	os.Setenv("QC2A_KEEPALIVE_HOURS", "2,10")
-	os.Setenv("QC2A_CREDIT_INTERVAL_HOURS", "12")
-	os.Setenv("QC2A_HARD_CREDIT", "24h")
+	os.Setenv("QC2A_MODELS_FILE", "/tmp/env-models.json")
 	defer os.Unsetenv("QC2A_API_KEY")
 	defer os.Unsetenv("QC2A_LISTEN")
 	defer os.Unsetenv("QC2A_KEEPALIVE_HOURS")
-	defer os.Unsetenv("QC2A_CREDIT_INTERVAL_HOURS")
-	defer os.Unsetenv("QC2A_HARD_CREDIT")
+	defer os.Unsetenv("QC2A_MODELS_FILE")
 
 	c, err := Load("")
 	if err != nil {
@@ -113,11 +95,8 @@ func TestLoadEnvOverride(t *testing.T) {
 	if len(c.Schedule.KeepaliveHours) != 2 || c.Schedule.KeepaliveHours[0] != 2 {
 		t.Errorf("KeepaliveHours = %v", c.Schedule.KeepaliveHours)
 	}
-	if c.Schedule.CreditIntervalHours != 12 {
-		t.Errorf("CreditIntervalHours = %d", c.Schedule.CreditIntervalHours)
-	}
-	if c.HardCreditDur != 24*time.Hour {
-		t.Errorf("HardCreditDur = %v", c.HardCreditDur)
+	if c.ModelsFile != "/tmp/env-models.json" {
+		t.Errorf("ModelsFile = %q", c.ModelsFile)
 	}
 }
 

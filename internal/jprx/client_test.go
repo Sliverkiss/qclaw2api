@@ -212,21 +212,22 @@ func Test4055APIV1Path(t *testing.T) {
 	}
 }
 
-// TestNewTokenCapture 校验 X-New-Token 捕获并原子落盘。
+// TestNewTokenCapture 校验 X-New-Token 捕获并原子落盘（开关开启时，走 4320）。
 func TestNewTokenCapture(t *testing.T) {
 	a, path := newTestAuth(t)
 	f := &fakeJPRX{
 		t:        t,
 		newToken: "jwt-refreshed",
 		paths: map[string]func(w http.ResponseWriter, r *http.Request){
-			"/data/4058/forward": func(w http.ResponseWriter, r *http.Request) {
-				respOK(w, `{"ret":0,"data":{"resp":{"common":{"code":0},"data":{"openclaw_channel_token":"ct-same"}}}}`)
+			"/data/4320/forward": func(w http.ResponseWriter, r *http.Request) {
+				respOK(w, `{"ret":0,"data":{"resp":{"common":{"code":0},"data":{"model_status_list":[{"id":"default","name":"Auto"}]}}}}`)
 			},
 		},
 	}
 	c, _ := newTestClient(t, f)
-	if err := c.RefreshChannelToken(context.Background(), a); err != nil {
-		t.Fatalf("RefreshChannelToken: %v", err)
+	c.SetCaptureNewToken(true)
+	if _, err := c.GetModelStatus(context.Background(), a); err != nil {
+		t.Fatalf("GetModelStatus: %v", err)
 	}
 	if a.JWTToken != "jwt-refreshed" {
 		t.Errorf("JWTToken = %q, want jwt-refreshed", a.JWTToken)
@@ -245,24 +246,50 @@ func TestNewTokenCapture(t *testing.T) {
 	}
 }
 
-// TestNewTokenSameValue 校验同值 X-New-Token 不重复落盘。
+// TestNewTokenSameValue 校验同值 X-New-Token 不重复落盘（开关开启时）。
 func TestNewTokenSameValue(t *testing.T) {
 	a, path := newTestAuth(t)
 	f := &fakeJPRX{
 		t:        t,
 		newToken: "jwt-old", // 与当前相同
 		paths: map[string]func(w http.ResponseWriter, r *http.Request){
-			"/data/4058/forward": func(w http.ResponseWriter, r *http.Request) {
-				respOK(w, `{"ret":0,"data":{"resp":{"common":{"code":0},"data":{"x":1}}}}`)
+			"/data/4320/forward": func(w http.ResponseWriter, r *http.Request) {
+				respOK(w, `{"ret":0,"data":{"resp":{"common":{"code":0},"data":{"model_status_list":[{"id":"default","name":"Auto"}]}}}}`)
 			},
 		},
 	}
 	c, _ := newTestClient(t, f)
-	if err := c.RefreshChannelToken(context.Background(), a); err != nil {
-		t.Fatalf("RefreshChannelToken: %v", err)
+	c.SetCaptureNewToken(true)
+	if _, err := c.GetModelStatus(context.Background(), a); err != nil {
+		t.Fatalf("GetModelStatus: %v", err)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("same-value token should not rewrite file")
+	}
+}
+
+// TestCaptureDisabled 校验开关关闭时不捕获 X-New-Token（运行期默认行为）。
+func TestCaptureDisabled(t *testing.T) {
+	a, path := newTestAuth(t)
+	f := &fakeJPRX{
+		t:        t,
+		newToken: "jwt-refreshed",
+		paths: map[string]func(w http.ResponseWriter, r *http.Request){
+			"/data/4320/forward": func(w http.ResponseWriter, r *http.Request) {
+				respOK(w, `{"ret":0,"data":{"resp":{"common":{"code":0},"data":{"model_status_list":[{"id":"default","name":"Auto"}]}}}}`)
+			},
+		},
+	}
+	c, _ := newTestClient(t, f)
+	// captureToken 默认 false
+	if _, err := c.GetModelStatus(context.Background(), a); err != nil {
+		t.Fatalf("GetModelStatus: %v", err)
+	}
+	if a.JWTToken != "jwt-old" {
+		t.Errorf("JWTToken = %q, want jwt-old (capture disabled)", a.JWTToken)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("no file should be written when capture disabled")
 	}
 }
 
@@ -338,44 +365,19 @@ func Test4320ModelStatus(t *testing.T) {
 	}
 }
 
-// Test4299GenerateImage 校验生图状态解析。
-func Test4299GenerateImage(t *testing.T) {
-	a, _ := newTestAuth(t)
-	f := &fakeJPRX{
-		t: t,
-		paths: map[string]func(w http.ResponseWriter, r *http.Request){
-			"/data/4299/forward": func(w http.ResponseWriter, r *http.Request) {
-				respOK(w, `{"ret":0,"data":{"resp":{"common":{"code":0},"data":{
-					"status":"pending","request_id":"req-1"}}}}`)
-			},
-		},
-	}
-	c, _ := newTestClient(t, f)
-	res, err := c.GenerateImage(context.Background(), a, "a cat")
-	if err != nil {
-		t.Fatalf("GenerateImage: %v", err)
-	}
-	if res.Status != "pending" || res.RequestID != "req-1" {
-		t.Errorf("res = %+v", res)
-	}
-	if f.lastBody["prompt"] != "a cat" {
-		t.Errorf("prompt = %v", f.lastBody["prompt"])
-	}
-}
-
-// Test21004LoginExpired 校验 21004 业务错误分类。
+// Test21004LoginExpired 校验 21004 业务错误分类（走 4320）。
 func Test21004LoginExpired(t *testing.T) {
 	a, _ := newTestAuth(t)
 	f := &fakeJPRX{
 		t: t,
 		paths: map[string]func(w http.ResponseWriter, r *http.Request){
-			"/data/4058/forward": func(w http.ResponseWriter, r *http.Request) {
+			"/data/4320/forward": func(w http.ResponseWriter, r *http.Request) {
 				respOK(w, `{"ret":0,"data":{"resp":{"common":{"code":21004,"message":"登录已过期"},"data":{}}}}`)
 			},
 		},
 	}
 	c, _ := newTestClient(t, f)
-	err := c.RefreshChannelToken(context.Background(), a)
+	_, err := c.GetModelStatus(context.Background(), a)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -388,19 +390,19 @@ func Test21004LoginExpired(t *testing.T) {
 	}
 }
 
-// TestHTTPError 校验 HTTP 5xx 返回错误。
+// TestHTTPError 校验 HTTP 5xx 返回错误（走 4320）。
 func TestHTTPError(t *testing.T) {
 	a, _ := newTestAuth(t)
 	f := &fakeJPRX{
 		t: t,
 		paths: map[string]func(w http.ResponseWriter, r *http.Request){
-			"/data/4058/forward": func(w http.ResponseWriter, r *http.Request) {
+			"/data/4320/forward": func(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, `{"error":"boom"}`, http.StatusBadGateway)
 			},
 		},
 	}
 	c, _ := newTestClient(t, f)
-	if err := c.RefreshChannelToken(context.Background(), a); err == nil {
+	if _, err := c.GetModelStatus(context.Background(), a); err == nil {
 		t.Fatal("expected error on 502")
 	}
 }

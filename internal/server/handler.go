@@ -6,13 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
-	"qclaw2api/internal/auth"
-	"qclaw2api/internal/jprx"
 	"qclaw2api/internal/pool"
 	"qclaw2api/internal/upstream"
 )
@@ -21,14 +19,12 @@ import (
 type Config struct {
 	Pool         *pool.Pool
 	Upstream     *upstream.Client
-	JPRX         *jprx.Client
+	ModelsFile   string        // models.json 路径；空 = 用 staticModels
 	APIKey       string        // 空 = 不鉴权
 	MaxRotate    int           // 单请求最多换号次数，默认 3
-	HardCooldown time.Duration // 余额不足/未激活冷却，默认 12h
 	SoftCooldown time.Duration // 429/rpm 冷却，默认 60s
 	ErrThreshold int           // 连续其他错误冷却阈值
 	ErrCooldown  time.Duration // 错误冷却时长
-	RefreshSkew  time.Duration // token 提前刷新窗口
 	// AggregateTimeout 非流式聚合总超时（P1-5），默认 120s；上游挂死时按时返回错误。
 	AggregateTimeout time.Duration
 }
@@ -38,16 +34,13 @@ type Handler struct {
 	cfg Config
 	mux *http.ServeMux
 
-	modelCache modelCache
+	modelStore *modelsStore
 }
 
 // NewHandler 构建 handler。
 func NewHandler(cfg Config) *Handler {
 	if cfg.MaxRotate <= 0 {
 		cfg.MaxRotate = 3
-	}
-	if cfg.HardCooldown <= 0 {
-		cfg.HardCooldown = 12 * time.Hour
 	}
 	if cfg.SoftCooldown <= 0 {
 		cfg.SoftCooldown = 60 * time.Second
@@ -58,15 +51,11 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.ErrCooldown <= 0 {
 		cfg.ErrCooldown = 10 * time.Minute
 	}
-	if cfg.RefreshSkew <= 0 {
-		cfg.RefreshSkew = 7 * 24 * time.Hour
-	}
 	if cfg.AggregateTimeout <= 0 {
 		cfg.AggregateTimeout = 120 * time.Second
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), modelStore: newModelsStore(cfg.ModelsFile)}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
-	h.mux.HandleFunc("POST /v1/images/generations", h.withAuth(h.images))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -122,84 +111,15 @@ var staticModels = []map[string]any{
 	{"id": "pool-minimax-m2.7", "object": "model", "created": 1753600000, "owned_by": "qclaw"},
 }
 
-// modelCache 动态模型缓存。
-type modelCache struct {
-	sync.RWMutex
-	ids      []string
-	fetched  time.Time
-	lastFail time.Time
-}
-
-const (
-	dynamicModelsTTL        = time.Hour
-	modelsFetchFailCooldown = 5 * time.Minute
-)
-
-// models 返回模型列表：优先 4320 动态（缓存 1h），失败回退静态表。
+// models 返回模型列表：读 models.json 文件（mtime 重载），失败回退静态表。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
-		"data":   h.modelList(r.Context()),
+		"data":   h.modelStore.list(),
 	})
 }
 
-// modelList 动态获取模型列表并包装成 OpenAI 格式。
-func (h *Handler) modelList(ctx context.Context) []map[string]any {
-	if ids := h.fetchModelIDs(ctx); len(ids) > 0 {
-		out := make([]map[string]any, 0, len(ids))
-		for _, id := range ids {
-			out = append(out, map[string]any{
-				"id":       id,
-				"object":   "model",
-				"created":  1753600000,
-				"owned_by": "qclaw",
-			})
-		}
-		return out
-	}
-	return staticModels
-}
-
-// fetchModelIDs 从池中任一健康账号调 4320 拉模型列表，缓存 1h；失败负缓存 5min。
-func (h *Handler) fetchModelIDs(ctx context.Context) []string {
-	h.modelCache.RLock()
-	if len(h.modelCache.ids) > 0 && time.Since(h.modelCache.fetched) < dynamicModelsTTL {
-		out := h.modelCache.ids
-		h.modelCache.RUnlock()
-		return out
-	}
-	if !h.modelCache.lastFail.IsZero() && time.Since(h.modelCache.lastFail) < modelsFetchFailCooldown {
-		h.modelCache.RUnlock()
-		return nil
-	}
-	h.modelCache.RUnlock()
-
-	acct := h.cfg.Pool.Pick()
-	if acct == nil {
-		return nil
-	}
-	ms, err := h.cfg.JPRX.GetModelStatus(ctx, acct)
-	if err != nil || len(ms.ModelStatusList) == 0 {
-		h.modelCache.Lock()
-		h.modelCache.lastFail = time.Now()
-		h.modelCache.Unlock()
-		return nil
-	}
-	ids := make([]string, 0, len(ms.ModelStatusList))
-	for _, m := range ms.ModelStatusList {
-		if m.ID != "" {
-			ids = append(ids, m.ID)
-		}
-	}
-	h.modelCache.Lock()
-	h.modelCache.ids = ids
-	h.modelCache.fetched = time.Now()
-	h.modelCache.lastFail = time.Time{}
-	h.modelCache.Unlock()
-	return ids
-}
-
-// chatCompletions 对话主流程：鉴权 → pool 挑号 → 惰性 refresh → aizone → SSE/聚合。
+// chatCompletions 对话主流程：鉴权 → pool 挑号 → aizone → SSE/聚合。
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 	if err != nil {
@@ -226,14 +146,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// token 临近过期 → 惰性 4058 refresh（失败冷却换号）
-		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
-			if err := h.refreshAccount(r.Context(), acct); err != nil {
-				lastErr = err
-				continue
-			}
-		}
-
 		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(r.Context(), acct, body)
 		if terr != nil {
 			// 客户端断开（ctx 已取消）：不算账号错误，不换号重试（P1-4）
@@ -248,7 +160,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			kind := upstream.Classify(status, string(respBody))
 			switch kind {
 			case upstream.ErrHardCredit:
-				h.cfg.Pool.Cooldown(acct.UserID, pool.CoolCredit, h.cfg.HardCooldown, "余额不足/未激活")
+				// 积分不足 → 冷却至下月1号，keepalive 每日探测恢复（SPEC §2.4）
+				h.cfg.Pool.CooldownCredit(acct.UserID, "积分不足，keepalive 探测恢复")
+				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+				continue
+			case upstream.ErrInactive:
+				// api_key_inactive 账号未激活，非积分问题 → CoolErr 10m
+				h.cfg.Pool.Cooldown(acct.UserID, pool.CoolErr, h.cfg.ErrCooldown, "api_key_inactive 账号未激活")
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 				continue
 			case upstream.ErrSoftRate:
@@ -259,8 +177,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.cfg.Pool.Disable(acct.UserID, "session dead, relogin required")
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 				continue
-			default:
+			case upstream.ErrServer:
 				h.cfg.Pool.NoteError(acct.UserID)
+				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+				continue
+			default:
+				// ErrClient：其他 4xx，记录完整 body 便于校准关键词（SPEC R1）
+				h.cfg.Pool.NoteError(acct.UserID)
+				log.Printf("chat uid=%s: client error %d body=%s",
+					acct.UserID, status, truncate(string(respBody), 200))
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 				continue
 			}
@@ -289,21 +214,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
 }
 
-// refreshAccount 对账号做惰性 4058 refresh；失败返回错误（调用方冷却/换号）。
-func (h *Handler) refreshAccount(ctx context.Context, acct *auth.Auth) error {
-	if err := h.cfg.JPRX.RefreshChannelToken(ctx, acct); err != nil {
-		var je *jprx.JPRXError
-		if errors.As(err, &je) && je.IsLoginExpired() {
-			h.cfg.Pool.Disable(acct.UserID, "refresh: 21004 session expired")
-		} else {
-			h.cfg.Pool.Cooldown(acct.UserID, pool.CoolErr, h.cfg.ErrCooldown, "refresh: "+err.Error())
-		}
-		return err
-	}
-	_ = acct.SaveAtomic()
-	return nil
-}
-
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -323,4 +233,13 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 			"code":    code,
 		},
 	})
+}
+
+// truncate 截断长文本用于错误信息/日志。
+func truncate(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		return s[:n] + "..."
+	}
+	return s
 }
