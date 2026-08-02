@@ -2,14 +2,11 @@ package scheduler
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
+	"errors"
 	"testing"
 	"time"
 
 	"qclaw2api/internal/auth"
-	"qclaw2api/internal/jprx"
 	"qclaw2api/internal/pool"
 )
 
@@ -25,140 +22,141 @@ func mkAuth(uid string) *auth.Auth {
 	}
 }
 
-// fakeJPRX 假 jprx 网关：4110 返回 balance，4075 返回限额，4058 返回空。
-type fakeJPRX struct {
-	balance  int64
-	limit    int64
-	reqs4110 int
-	reqs4075 int
-	reqs4058 int
+// probeRecorder 记录每次探测的 uid 与结果，可注入错误。
+type probeRecorder struct {
+	calls   map[string]int
+	errByID map[string]error
 }
 
-func (f *fakeJPRX) handler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	switch {
-	case r.URL.Path == "/data/4110/forward":
-		f.reqs4110++
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ret": 0, "data": map[string]any{
-				"resp": map[string]any{"common": map[string]any{"code": 0}, "data": map[string]any{
-					"balance": f.balance,
-					"balance_detail": map[string]any{
-						"activity_q": f.balance,
-						"items":      []any{},
-					},
-				}},
-			},
-		})
-	case r.URL.Path == "/data/4075/forward":
-		f.reqs4075++
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ret": 0, "data": map[string]any{
-				"resp": map[string]any{"common": map[string]any{"code": 0}, "data": map[string]any{
-					"daily_token_limit": f.limit, "daily_token_used": 0, "rpm_limit": 60,
-				}},
-			},
-		})
-	case r.URL.Path == "/data/4058/forward":
-		f.reqs4058++
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ret": 0, "data": map[string]any{
-				"resp": map[string]any{"common": map[string]any{"code": 0}, "data": map[string]any{
-					"openclaw_channel_token": "ct-same",
-				}},
-			},
-		})
-	default:
-		http.NotFound(w, r)
+func newProbeRecorder() *probeRecorder {
+	return &probeRecorder{calls: map[string]int{}, errByID: map[string]error{}}
+}
+
+func (r *probeRecorder) probe(a *auth.Auth) error {
+	if a == nil {
+		return errors.New("nil auth")
 	}
+	r.calls[a.UserID]++
+	return r.errByID[a.UserID]
 }
 
-// newTestScheduler 组装 scheduler + 假 jprx 网关。
-func newTestScheduler(t *testing.T, j *fakeJPRX) (*Scheduler, *pool.Pool) {
+// newTestScheduler 组装 scheduler + 注入 probe recorder。
+func newTestScheduler(t *testing.T, rec *probeRecorder) (*Scheduler, *pool.Pool) {
 	t.Helper()
-	jSrv := httptest.NewServer(http.HandlerFunc(j.handler))
-	t.Cleanup(jSrv.Close)
-
 	p := pool.New("", pool.Config{RPM: 60, ErrThreshold: 5, ErrCooldown: 10 * time.Minute})
 	p.Add(mkAuth("1"))
-
-	jc := jprx.New()
-	jc.SetBase(jSrv.URL)
-
+	p.Add(mkAuth("2"))
 	s := New(Config{
-		Pool:                p,
-		JPRX:                jc,
-		KeepaliveHours:      []int{4},
-		CreditIntervalHours: 6,
+		Pool:           p,
+		KeepaliveHours: []int{4},
+		Probe:          rec.probe,
 	})
 	return s, p
 }
 
-// TestRunCreditNow 校验积分刷新调用（4110/4075 仍执行，但不再更新 pool credits）。
-func TestRunCreditNow(t *testing.T) {
-	j := &fakeJPRX{balance: 500, limit: 40000000}
-	s, _ := newTestScheduler(t, j)
+// TestRunKeepaliveProbeRecovers 校验探测成功 → Recover 解除冷却。
+func TestRunKeepaliveProbeRecovers(t *testing.T) {
+	rec := newProbeRecorder()
+	s, p := newTestScheduler(t, rec)
 
-	s.RunCreditNow(context.Background())
-	if j.reqs4110 != 1 {
-		t.Errorf("4110 calls = %d, want 1", j.reqs4110)
+	// uid1 积分冷却；uid2 正常（不探测）
+	p.CooldownCredit("1", "积分不足")
+	if got := p.PickExcluding(map[string]bool{"2": true}); got != nil {
+		t.Fatal("expected uid1 cooled")
 	}
-	if j.reqs4075 != 1 {
-		t.Errorf("4075 calls = %d, want 1", j.reqs4075)
-	}
-}
-
-// TestRunCreditNowSkipsCooldown 冷却中账号跳过（不调上游）。
-func TestRunCreditNowSkipsCooldown(t *testing.T) {
-	j := &fakeJPRX{balance: 500, limit: 40000000}
-	s, p := newTestScheduler(t, j)
-
-	// 冷却账号
-	p.Cooldown("1", pool.CoolRate, 12*time.Hour, pool.ReasonSoftRate)
-
-	s.RunCreditNow(context.Background())
-	if j.reqs4110 != 0 {
-		t.Errorf("4110 calls = %d, want 0 (cooling skipped)", j.reqs4110)
-	}
-}
-
-// TestRunKeepaliveNow 校验 4058 续期。
-func TestRunKeepaliveNow(t *testing.T) {
-	j := &fakeJPRX{balance: 100, limit: 40000000}
-	s, _ := newTestScheduler(t, j)
 
 	s.RunKeepaliveNow(context.Background(), "2026-08-02")
-	if j.reqs4058 != 1 {
-		t.Errorf("4058 calls = %d, want 1", j.reqs4058)
+
+	if rec.calls["1"] != 1 {
+		t.Errorf("probe uid1 calls = %d, want 1", rec.calls["1"])
+	}
+	if rec.calls["2"] != 0 {
+		t.Errorf("probe uid2 calls = %d, want 0 (healthy accounts not probed)", rec.calls["2"])
+	}
+	st, _ := p.Status("1")
+	if st.Cooling || st.Reason != "" {
+		t.Errorf("uid1 should be recovered after probe OK: %+v", st)
+	}
+	if got := p.PickExcluding(map[string]bool{"2": true}); got == nil || got.UserID != "1" {
+		t.Fatalf("expected uid1 pickable after recover, got %v", got)
 	}
 }
 
-// TestTickTriggersCredit 校验 tick 到间隔小时后触发积分刷新。
-func TestTickTriggersCredit(t *testing.T) {
-	j := &fakeJPRX{balance: 500, limit: 40000000}
-	s, _ := newTestScheduler(t, j)
+// TestRunKeepaliveProbeFail 校验探测失败 → 保持冷却。
+func TestRunKeepaliveProbeFail(t *testing.T) {
+	rec := newProbeRecorder()
+	rec.errByID["1"] = errors.New("upstream 402 credit")
+	s, p := newTestScheduler(t, rec)
 
-	base := time.Date(2026, 8, 2, 12, 0, 0, 0, time.Local)
-	s.setNow(func() time.Time { return base })
-	// 先跑一次记录 creditLast = base
-	s.RunCreditNow(context.Background())
-	// 快进 7 小时
-	s.setNow(func() time.Time { return base.Add(7 * time.Hour) })
-	s.tick(context.Background())
-	if j.reqs4110 < 2 {
-		t.Errorf("4110 calls = %d, want >= 2 (interval elapsed)", j.reqs4110)
+	p.CooldownCredit("1", "积分不足")
+
+	s.RunKeepaliveNow(context.Background(), "2026-08-02")
+
+	if rec.calls["1"] != 1 {
+		t.Errorf("probe uid1 calls = %d, want 1", rec.calls["1"])
+	}
+	st, _ := p.Status("1")
+	if !st.Cooling {
+		t.Errorf("uid1 should stay cooling after probe fail: %+v", st)
+	}
+	if got := p.PickExcluding(map[string]bool{"2": true}); got != nil {
+		t.Fatalf("uid1 must not be pickable while cooling: %v", got)
 	}
 }
 
-// TestTickKeepaliveAtHour 校验 keepalive 小时触发 4058。
+// TestRunKeepaliveDayDedup 校验当日 keepalive 不重复执行（同一 dayKey）。
+func TestRunKeepaliveDayDedup(t *testing.T) {
+	rec := newProbeRecorder()
+	s, p := newTestScheduler(t, rec)
+
+	p.CooldownCredit("1", "积分不足")
+
+	dayKey := "2026-08-02"
+	s.RunKeepaliveNow(context.Background(), dayKey)
+	s.RunKeepaliveNow(context.Background(), dayKey)
+
+	if rec.calls["1"] != 1 {
+		t.Errorf("probe uid1 calls = %d, want 1 (day dedup)", rec.calls["1"])
+	}
+}
+
+// TestTickKeepaliveAtHour 校验 keepalive 小时触发探测，非 keepalive 小时不触发。
 func TestTickKeepaliveAtHour(t *testing.T) {
-	j := &fakeJPRX{balance: 100, limit: 40000000}
-	s, _ := newTestScheduler(t, j)
+	rec := newProbeRecorder()
+	s, p := newTestScheduler(t, rec)
+	p.CooldownCredit("1", "积分不足")
 
-	base := time.Date(2026, 8, 2, 4, 0, 0, 0, time.Local) // keepalive hour 4
-	s.setNow(func() time.Time { return base })
+	// 非 keepalive 小时：不触发
+	s.setNow(func() time.Time { return time.Date(2026, 8, 2, 12, 0, 0, 0, time.Local) })
 	s.tick(context.Background())
-	if j.reqs4058 != 1 {
-		t.Errorf("4058 calls = %d, want 1 (hour 4)", j.reqs4058)
+	if rec.calls["1"] != 0 {
+		t.Errorf("calls at hour 12 = %d, want 0", rec.calls["1"])
+	}
+
+	// keepalive 小时 4：触发
+	s.setNow(func() time.Time { return time.Date(2026, 8, 2, 4, 0, 0, 0, time.Local) })
+	s.tick(context.Background())
+	if rec.calls["1"] != 1 {
+		t.Errorf("calls at hour 4 = %d, want 1", rec.calls["1"])
+	}
+}
+
+// TestTickKeepaliveDayDedup 校验 tick 当日去重：第二次同一日 tick 不再探测。
+func TestTickKeepaliveDayDedup(t *testing.T) {
+	rec := newProbeRecorder()
+	s, p := newTestScheduler(t, rec)
+	p.CooldownCredit("1", "积分不足")
+
+	s.setNow(func() time.Time { return time.Date(2026, 8, 2, 4, 0, 0, 0, time.Local) })
+	s.tick(context.Background())
+	if rec.calls["1"] != 1 {
+		t.Fatalf("first tick calls = %d, want 1", rec.calls["1"])
+	}
+	// 同一天再跑一次 tick（重置冷却以便可再次探测到 uid1，模拟下一轮）
+	p.Recover("1")
+	p.CooldownCredit("1", "积分不足")
+	s.tick(context.Background())
+	if rec.calls["1"] != 1 {
+		t.Errorf("second tick calls = %d, want 1 (day dedup)", rec.calls["1"])
 	}
 }

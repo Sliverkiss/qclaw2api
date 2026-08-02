@@ -1,5 +1,5 @@
-// Package scheduler 定时任务：积分刷新（4110+4075）+ token 续期（4058）。
-// QClaw 无签到机制（SPEC §1.6），故不含 checkin。
+// Package scheduler 定时任务：每日冷却恢复探测（keepalive）。
+// 对冷却中账号发 max_tokens=1 最小对话测试，通过则恢复（Recover），失败保持冷却。
 package scheduler
 
 import (
@@ -8,24 +8,22 @@ import (
 	"sync"
 	"time"
 
-	"qclaw2api/internal/jprx"
+	"qclaw2api/internal/auth"
 	"qclaw2api/internal/pool"
 )
 
 // Config scheduler 构造参数。
 type Config struct {
-	Pool                *pool.Pool
-	JPRX                *jprx.Client
-	KeepaliveHours      []int // 每日 4058 续期整点，默认 [4]
-	CreditIntervalHours int   // 积分刷新间隔小时，默认 6
+	Pool           *pool.Pool
+	KeepaliveHours []int // 每日探测整点，默认 [4]
+	Probe          func(*auth.Auth) error
 }
 
 // Scheduler 定时任务调度器。
 type Scheduler struct {
 	cfg          Config
 	mu           sync.Mutex
-	creditLast   time.Time // 上次积分刷新时间
-	keepaliveDay string    // 当日 keepalive 已执行标记
+	keepaliveDay string // 当日 keepalive 已执行标记
 	now          func() time.Time
 }
 
@@ -34,18 +32,14 @@ func New(cfg Config) *Scheduler {
 	if len(cfg.KeepaliveHours) == 0 {
 		cfg.KeepaliveHours = []int{4}
 	}
-	if cfg.CreditIntervalHours <= 0 {
-		cfg.CreditIntervalHours = 6
-	}
 	return &Scheduler{cfg: cfg, now: time.Now}
 }
 
 // setNow 覆盖时间函数（测试注入）。
 func (s *Scheduler) setNow(f func() time.Time) { s.now = f }
 
-// Run 启动调度循环：启动时立即积分刷新一次，之后按间隔循环。
+// Run 启动调度循环：等待整点触发 keepalive。
 func (s *Scheduler) Run(ctx context.Context) {
-	s.RunCreditNow(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -56,18 +50,10 @@ func (s *Scheduler) Run(ctx context.Context) {
 	}
 }
 
-// tick 每分钟检查一次：到达间隔小时 → 积分刷新；当前小时在 keepalive 列表 → 续期。
+// tick 每分钟检查一次：当前小时在 keepalive 列表且当日未跑过 → 探测冷却中账号。
 func (s *Scheduler) tick(ctx context.Context) {
 	now := s.now()
 	hour := now.Hour()
-	interval := s.cfg.CreditIntervalHours
-
-	// 积分刷新：距上次超过 interval 小时
-	if s.creditLast.IsZero() || now.Sub(s.creditLast) >= time.Duration(interval)*time.Hour {
-		s.RunCreditNow(ctx)
-	}
-
-	// keepalive：当前小时在 keepalive_hours 且当日未跑过
 	dayKey := now.Format("2006-01-02")
 	if contains(s.cfg.KeepaliveHours, hour) && !s.ranKeepaliveToday(dayKey) {
 		s.RunKeepaliveNow(ctx, dayKey)
@@ -90,56 +76,24 @@ func contains(hours []int, h int) bool {
 	return false
 }
 
-// RunCreditNow 立即对全账号刷新积分（4110 Q 点 + 4075 今日额度），
-// 余额>0 自动解冻 hard_credit。冷却/禁用账号跳过；账号间隔 200ms。
-func (s *Scheduler) RunCreditNow(ctx context.Context) {
-	s.mu.Lock()
-	s.creditLast = s.now()
-	s.mu.Unlock()
-
-	for _, uid := range s.cfg.Pool.UIDs() {
-		acct := s.cfg.Pool.AuthByUID(uid)
-		if acct == nil {
-			continue
-		}
-		st, ok := s.cfg.Pool.Status(uid)
-		if ok && (st.Disabled || st.Cooling) {
-			continue
-		}
-		// 4110 Q 点（余额不再写回 pool；无 credits 字段）
-		if _, err := s.cfg.JPRX.GetQBalance(ctx, acct); err != nil {
-			log.Printf("credit uid=%s: 4110: %v", uid, err)
-		}
-		// 4075 今日额度（展示用，失败不阻塞）
-		if _, err := s.cfg.JPRX.GetTodayTokens(ctx, acct); err != nil {
-			log.Printf("credit uid=%s: 4075: %v", uid, err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(200 * time.Millisecond):
-		}
-	}
-}
-
-// RunKeepaliveNow 立即对全账号调 4058（X-New-Token 由 jprx client 捕获并落盘）。
-// 禁用账号跳过。
+// RunKeepaliveNow 立即对冷却中账号做对话探测：成功 Recover，失败保持冷却。
+// 禁用账号跳过。当日去重由调用方（tick/Run）负责。
 func (s *Scheduler) RunKeepaliveNow(ctx context.Context, dayKey string) {
 	s.mu.Lock()
 	s.keepaliveDay = dayKey
 	s.mu.Unlock()
 
-	for _, uid := range s.cfg.Pool.UIDs() {
+	for _, uid := range s.cfg.Pool.CoolingUIDs() {
 		acct := s.cfg.Pool.AuthByUID(uid)
 		if acct == nil {
 			continue
 		}
-		st, ok := s.cfg.Pool.Status(uid)
-		if ok && st.Disabled {
-			continue
-		}
-		if err := s.cfg.JPRX.RefreshChannelToken(ctx, acct); err != nil {
-			log.Printf("keepalive uid=%s: 4058: %v", uid, err)
+		// Probe 内部自带 15s 超时，防止上游挂起阻塞 keepalive。
+		if err := s.cfg.Probe(acct); err == nil {
+			s.cfg.Pool.Recover(uid)
+			log.Printf("keepalive: uid=%s probe OK, recovered", uid)
+		} else {
+			log.Printf("keepalive: uid=%s probe fail, keep cooling: %v", uid, err)
 		}
 	}
 }

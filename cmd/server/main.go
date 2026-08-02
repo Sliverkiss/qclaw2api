@@ -4,10 +4,12 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,6 +20,15 @@ import (
 	"qclaw2api/internal/server"
 	"qclaw2api/internal/upstream"
 )
+
+// truncate 截断长文本用于错误信息。
+func truncate(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		return s[:n] + "..."
+	}
+	return s
+}
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
@@ -66,12 +77,26 @@ func main() {
 		PollTimeout:  time.Duration(cfg.Image.PollTimeoutSeconds) * time.Second,
 	})
 
-	// scheduler
+	// scheduler：每日冷却恢复探测（对冷却中账号发 max_tokens=1 最小对话测试）
 	sch := scheduler.New(scheduler.Config{
-		Pool:                p,
-		JPRX:                jc,
-		KeepaliveHours:      cfg.Schedule.KeepaliveHours,
-		CreditIntervalHours: cfg.Schedule.CreditIntervalHours,
+		Pool:           p,
+		KeepaliveHours: cfg.Schedule.KeepaliveHours,
+		Probe: func(acct *auth.Auth) error {
+			probeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			body := []byte(`{"model":"default","messages":[{"role":"user","content":"hi"}],"max_tokens":1,"stream":false}`)
+			rc, status, respBody, err := up.ChatStream(probeCtx, acct, body)
+			if err != nil {
+				return err
+			}
+			if rc != nil {
+				defer rc.Close()
+			}
+			if status >= 400 {
+				return fmt.Errorf("probe upstream %d: %s", status, truncate(string(respBody), 200))
+			}
+			return nil
+		},
 	})
 
 	// HTTP handler
