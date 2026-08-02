@@ -161,6 +161,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			switch kind {
 			case upstream.ErrHardCredit:
 				// 积分不足 → 冷却至下月1号，keepalive 每日探测恢复（SPEC §2.4）
+				// 打印完整上游 body 便于校准 balanceMarkers 关键词（SPEC R1）
+				log.Printf("chat uid=%s: hard_credit %d body=%s",
+					acct.UserID, status, truncate(string(respBody), 200))
 				h.cfg.Pool.CooldownCredit(acct.UserID, "积分不足，keepalive 探测恢复")
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 				continue
