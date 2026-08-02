@@ -1,0 +1,10 @@
+auths/
+data/
+config.json
+.git/
+docs/
+*.md
+*.tmp
+login
+credit
+qclaw2api

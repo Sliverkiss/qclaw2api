@@ -1,0 +1,27 @@
+{
+  "listen": ":7865",
+  "api_key": "change-me",
+  "auth_dir": "./auths",
+  "state_file": "./data/state.json",
+  "cooldown": {
+    "hard_credit": "12h",
+    "soft_rate": "60s",
+    "err_threshold": 5,
+    "err_cooldown": "10m"
+  },
+  "schedule": {
+    "keepalive_hours": [4],
+    "credit_interval_hours": 6
+  },
+  "upstream": {
+    "response_header_timeout_seconds": 30,
+    "timeout_seconds": 120
+  },
+  "image": {
+    "poll_interval_seconds": 3,
+    "poll_timeout_seconds": 120
+  },
+  "refresh": {
+    "skew_days": 7
+  }
+}

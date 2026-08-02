@@ -1,0 +1,16 @@
+services:
+  qclaw2api:
+    build: .
+    container_name: qclaw2api
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+      - QC2A_API_KEY=${QC2A_API_KEY:-change-me}
+    ports:
+      - "7865:7865"
+    # 挂载目录属主需为容器内 app 用户(10001)：宿主侧先 chown -R 10001:10001 auths data
+    # （login.sh 落盘后会自动处理；手动部署见 README）
+    volumes:
+      - ./auths:/app/auths
+      - ./data:/app/data
+      - ./config.json:/app/config.json:ro

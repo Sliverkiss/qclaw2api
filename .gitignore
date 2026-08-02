@@ -1,0 +1,17 @@
+# 真实凭据与运行时状态 —— 永不入库
+auths/
+data/
+config.json
+docs/
+*.tmp
+
+# 构建产物与临时文件
+/login
+/credit
+/qclaw2api
+/server
+__pycache__/
+
+# 编辑器
+.idea/
+.vscode/
