@@ -84,9 +84,7 @@ func newTestHandler(t *testing.T, aiz *fakeAizone, j *fakeJPRX) (*Handler, *pool
 
 	p := pool.New("", pool.Config{RPM: 60, ErrThreshold: 5, ErrCooldown: 10 * time.Minute})
 	p.Add(mkAuth("1"))
-	p.SetCredits("1", 100)
 	p.Add(mkAuth("2"))
-	p.SetCredits("2", 300)
 
 	up := upstream.New()
 	up.SetChatURL(aizSrv.URL + "/aizone/v1/chat/completions")
@@ -212,9 +210,7 @@ func TestChatRotateOnServerError(t *testing.T) {
 
 	p := pool.New("", pool.Config{RPM: 60, ErrThreshold: 5, ErrCooldown: 10 * time.Minute})
 	p.Add(mkAuth("1"))
-	p.SetCredits("1", 100)
 	p.Add(mkAuth("2"))
-	p.SetCredits("2", 300)
 
 	up := upstream.New()
 	up.SetChatURL(aizSrv.URL + "/chat")

@@ -81,7 +81,6 @@ func newTestScheduler(t *testing.T, j *fakeJPRX) (*Scheduler, *pool.Pool) {
 
 	p := pool.New("", pool.Config{RPM: 60, ErrThreshold: 5, ErrCooldown: 10 * time.Minute})
 	p.Add(mkAuth("1"))
-	p.SetCredits("1", 100)
 
 	jc := jprx.New()
 	jc.SetBase(jSrv.URL)
@@ -95,10 +94,10 @@ func newTestScheduler(t *testing.T, j *fakeJPRX) (*Scheduler, *pool.Pool) {
 	return s, p
 }
 
-// TestRunCreditNow 校验积分刷新：4110 更新 balance。
+// TestRunCreditNow 校验积分刷新调用（4110/4075 仍执行，但不再更新 pool credits）。
 func TestRunCreditNow(t *testing.T) {
 	j := &fakeJPRX{balance: 500, limit: 40000000}
-	s, p := newTestScheduler(t, j)
+	s, _ := newTestScheduler(t, j)
 
 	s.RunCreditNow(context.Background())
 	if j.reqs4110 != 1 {
@@ -107,35 +106,6 @@ func TestRunCreditNow(t *testing.T) {
 	if j.reqs4075 != 1 {
 		t.Errorf("4075 calls = %d, want 1", j.reqs4075)
 	}
-	st, _ := p.Status("1")
-	if st.Credits != 500 {
-		t.Errorf("credits = %v, want 500", st.Credits)
-	}
-}
-
-// TestRunCreditNowReenables 校验余额>0 自动解冻 hard_credit。
-func TestRunCreditNowReenables(t *testing.T) {
-	j := &fakeJPRX{balance: 500, limit: 40000000}
-	s, p := newTestScheduler(t, j)
-
-	// 余额 0 → hard_credit 冷却
-	p.SetCredits("1", 0)
-	p.Cooldown("1", pool.CoolHard, 12*time.Hour, pool.ReasonHardCredit)
-	if got := p.Pick(); got != nil {
-		t.Fatal("expected cooled")
-	}
-
-	// 但冷却中的账号会被 RunCreditNow 跳过（不调上游），无法解冻。
-	// 解冻路径：先解除冷却（模拟冷却到期），再刷新 → 更新余额。
-	p.ClearCooldown("1")
-	s.RunCreditNow(context.Background())
-	if got := p.Pick(); got == nil {
-		t.Error("account should be pickable after credits")
-	}
-	st, _ := p.Status("1")
-	if st.Credits != 500 {
-		t.Errorf("credits = %v, want 500", st.Credits)
-	}
 }
 
 // TestRunCreditNowSkipsCooldown 冷却中账号跳过（不调上游）。
@@ -143,9 +113,8 @@ func TestRunCreditNowSkipsCooldown(t *testing.T) {
 	j := &fakeJPRX{balance: 500, limit: 40000000}
 	s, p := newTestScheduler(t, j)
 
-	// 余额 0 → hard_credit 冷却
-	p.SetCredits("1", 0)
-	p.Cooldown("1", pool.CoolHard, 12*time.Hour, pool.ReasonHardCredit)
+	// 冷却账号
+	p.Cooldown("1", pool.CoolRate, 12*time.Hour, pool.ReasonSoftRate)
 
 	s.RunCreditNow(context.Background())
 	if j.reqs4110 != 0 {

@@ -106,10 +106,8 @@ func (s *Scheduler) RunCreditNow(ctx context.Context) {
 		if ok && (st.Disabled || st.Cooling) {
 			continue
 		}
-		// 4110 Q 点
-		if qb, err := s.cfg.JPRX.GetQBalance(ctx, acct); err == nil {
-			s.cfg.Pool.ReenableIfCredits(uid, qb.Balance)
-		} else {
+		// 4110 Q 点（余额不再写回 pool；无 credits 字段）
+		if _, err := s.cfg.JPRX.GetQBalance(ctx, acct); err != nil {
 			log.Printf("credit uid=%s: 4110: %v", uid, err)
 		}
 		// 4075 今日额度（展示用，失败不阻塞）

@@ -1,5 +1,5 @@
 // Package pool 账号池：内存索引 + 冷却/禁用状态机 + state.json 持久化 + 60rpm 令牌桶。
-// 挑选策略：healthy 中 Q 点最高；余额相近(<5%)按 lastPick 轮转。
+// 挑选策略：healthy 中 lastPick 最早者（纯 round-robin）。
 package pool
 
 import (
@@ -18,16 +18,16 @@ import (
 type CoolKind int
 
 const (
-	CoolHard CoolKind = iota // 余额不足 / 403 api_key_inactive → 长冷却
-	CoolSoft                 // 429 / rpm 超限 → 短冷却
-	CoolErr                  // 连续错误 → 中冷却
+	CoolCredit CoolKind = iota // 积分不足 → 冷却至下月1号（keepalive 探测恢复）
+	CoolRate                   // 429 / rpm 超限 → 短冷却
+	CoolErr                    // 连续错误 / api_key_inactive → 中冷却
 )
 
 func (k CoolKind) String() string {
 	switch k {
-	case CoolHard:
-		return "hard_credit"
-	case CoolSoft:
+	case CoolCredit:
+		return "credit"
+	case CoolRate:
 		return "soft_rate"
 	case CoolErr:
 		return "error_threshold"
@@ -37,17 +37,16 @@ func (k CoolKind) String() string {
 
 // Reason 常量（状态机 reason 字段）。
 const (
-	ReasonHardCredit = "hard_credit: no balance"
-	ReasonSoftRate   = "soft_rate: rate limited"
-	ReasonErr        = "error_threshold: consecutive errors"
-	ReasonDisabled   = "disabled: session expired, relogin required"
+	ReasonCredit   = "credit: no balance"
+	ReasonSoftRate = "soft_rate: rate limited"
+	ReasonErr      = "error_threshold: consecutive errors"
+	ReasonDisabled = "disabled: session expired, relogin required"
 )
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
 	UID      string    `json:"uid"`
 	Nickname string    `json:"nickname,omitempty"`
-	Credits  float64   `json:"credits"`
 	Cooling  bool      `json:"cooling"`
 	Until    time.Time `json:"until,omitempty"`
 	Reason   string    `json:"reason,omitempty"`
@@ -58,10 +57,9 @@ type Status struct {
 
 type entry struct {
 	a        *auth.Auth
-	credits  float64
 	disabled bool
 	reason   string
-	coolKind CoolKind // 当前冷却类型（F7：积分刷新仅解冻 CoolHard）
+	coolKind CoolKind // 当前冷却类型
 	until    time.Time
 	errCount int
 	lastPick time.Time
@@ -84,10 +82,9 @@ func (e *entry) healthy(now time.Time) bool {
 // stateFile 持久化格式。
 type stateFile struct {
 	Accounts map[string]struct {
-		Credits  float64   `json:"credits"`
 		Disabled bool      `json:"disabled"`
 		Reason   string    `json:"reason,omitempty"`
-		CoolKind CoolKind  `json:"cool_kind,omitempty"` // F7：冷却类型，重启后积分刷新仍只解冻 hard
+		CoolKind CoolKind  `json:"cool_kind,omitempty"`
 		Until    time.Time `json:"until,omitempty"`
 		LastPick time.Time `json:"last_pick,omitempty"`
 	} `json:"accounts"`
@@ -143,7 +140,7 @@ func (p *Pool) Add(a *auth.Auth) {
 	defer p.mu.Unlock()
 	now := time.Now()
 	if e, ok := p.byUID[a.UserID]; ok {
-		e.a = a // 保留 credits/cooling 状态
+		e.a = a // 保留 cooling/disabled 状态
 		return
 	}
 	p.byUID[a.UserID] = &entry{
@@ -178,7 +175,7 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	}
 }
 
-// Pick 返回 healthy 中 Q 点最高（相近按 lastPick 轮转）的账号；无可用返回 nil。
+// Pick 返回 healthy 中 lastPick 最早者（round-robin）；无可用返回 nil。
 func (p *Pool) Pick() *auth.Auth {
 	return p.PickExcluding(nil)
 }
@@ -205,30 +202,12 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 		return nil
 	}
 
-	// 候选中的最高余额，用于 5% 相近判断
-	var maxCredits float64 = -1
-	for _, e := range cand {
-		if e.credits > maxCredits {
-			maxCredits = e.credits
-		}
-	}
-	floor := float64(0)
-	if maxCredits > 0 {
-		floor = maxCredits - maxCredits*0.05
-	}
-
-	// 余额 >= floor 的候选中选 lastPick 最早者
+	// round-robin：候选中选 lastPick 最早者
 	var best *entry
 	for _, e := range cand {
-		if e.credits < floor {
-			continue
-		}
 		if best == nil || e.lastPick.Before(best.lastPick) {
 			best = e
 		}
-	}
-	if best == nil {
-		return nil
 	}
 	best.lastPick = now
 	return best.a
@@ -257,12 +236,22 @@ func (p *Pool) ReserveToken(uid string) bool {
 	return false
 }
 
-// SetCredits 更新账号余额。
-func (p *Pool) SetCredits(uid string, credits float64) {
+// NextMonthStart 返回 now 所在月份的下月 1 号 00:00（本地时区）。
+// time.Date 自动处理跨年（12 月 → 次年 1 月）。
+func NextMonthStart(now time.Time) time.Time {
+	y, m, _ := now.Date()
+	return time.Date(y, m+1, 1, 0, 0, 0, 0, now.Location())
+}
+
+// CooldownCredit 积分不足冷却至下月 1 号 00:00，由 keepalive 每日探测恢复。
+func (p *Pool) CooldownCredit(uid, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		e.credits = credits
+		e.until = NextMonthStart(time.Now())
+		e.reason = reason
+		e.coolKind = CoolCredit
+		e.errCount = 0
 	}
 	p.saveLocked()
 }
@@ -306,21 +295,33 @@ func (p *Pool) ClearCooldown(uid string) {
 	p.saveLocked()
 }
 
-// ReenableIfCredits 积分刷新后解冻（F7/P1-6）：仅解冻 hard_credit 冷却（余额类），
-// soft_rate / error_threshold 冷却不受积分刷新影响，需按各自时长自然到期。
-// 余额始终更新；禁用账号永不解冻。
-func (p *Pool) ReenableIfCredits(uid string, remain float64) {
+// CoolingUIDs 返回冷却中且未禁用的账号 uid（scheduler keepalive 探测用）。
+func (p *Pool) CoolingUIDs() []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	var uids []string
+	for uid, e := range p.byUID {
+		if e.disabled {
+			continue
+		}
+		if !e.until.IsZero() && now.Before(e.until) {
+			uids = append(uids, uid)
+		}
+	}
+	sort.Strings(uids)
+	return uids
+}
+
+// Recover 清除账号冷却标记（keepalive 探测通过后恢复；也清 errCount）。
+func (p *Pool) Recover(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		e.credits = remain
-		cooling := !e.until.IsZero() && time.Now().Before(e.until)
-		if remain > 0 && !e.disabled && cooling && e.coolKind == CoolHard {
-			e.until = time.Time{}
-			e.reason = ""
-			e.coolKind = 0
-			e.errCount = 0
-		}
+		e.until = time.Time{}
+		e.reason = ""
+		e.coolKind = 0
+		e.errCount = 0
 	}
 	p.saveLocked()
 }
@@ -334,7 +335,7 @@ func (p *Pool) NoteError(uid string) {
 		if e.errCount >= p.errThr {
 			e.until = time.Now().Add(p.errDur)
 			e.reason = ReasonErr
-			e.coolKind = CoolErr // F7：err 冷却类型，不受积分刷新解冻
+			e.coolKind = CoolErr
 			e.errCount = 0
 		}
 	}
@@ -404,7 +405,6 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	return Status{
 		UID:      uid,
 		Nickname: e.a.Nickname,
-		Credits:  e.credits,
 		Cooling:  !e.until.IsZero() && now.Before(e.until),
 		Until:    e.until,
 		Reason:   e.reason,
@@ -431,10 +431,9 @@ func (p *Pool) load() {
 	for uid, s := range sf.Accounts {
 		p.byUID[uid] = &entry{
 			a:          &auth.Auth{UserID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:    s.Credits,
 			disabled:   s.Disabled,
 			reason:     s.Reason,
-			coolKind:   s.CoolKind, // F7
+			coolKind:   s.CoolKind,
 			until:      s.Until,
 			lastPick:   s.LastPick,
 			lastRefill: now,
@@ -449,7 +448,6 @@ func (p *Pool) saveLocked() {
 		return
 	}
 	sf := stateFile{Accounts: map[string]struct {
-		Credits  float64   `json:"credits"`
 		Disabled bool      `json:"disabled"`
 		Reason   string    `json:"reason,omitempty"`
 		CoolKind CoolKind  `json:"cool_kind,omitempty"`
@@ -458,17 +456,15 @@ func (p *Pool) saveLocked() {
 	}{}}
 	for uid, e := range p.byUID {
 		sf.Accounts[uid] = struct {
-			Credits  float64   `json:"credits"`
 			Disabled bool      `json:"disabled"`
 			Reason   string    `json:"reason,omitempty"`
 			CoolKind CoolKind  `json:"cool_kind,omitempty"`
 			Until    time.Time `json:"until,omitempty"`
 			LastPick time.Time `json:"last_pick,omitempty"`
 		}{
-			Credits:  e.credits,
 			Disabled: e.disabled,
 			Reason:   e.reason,
-			CoolKind: e.coolKind, // F7
+			CoolKind: e.coolKind,
 			Until:    e.until,
 			LastPick: e.lastPick,
 		}

@@ -248,11 +248,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			kind := upstream.Classify(status, string(respBody))
 			switch kind {
 			case upstream.ErrHardCredit:
-				h.cfg.Pool.Cooldown(acct.UserID, pool.CoolHard, h.cfg.HardCooldown, "余额不足/未激活")
+				h.cfg.Pool.Cooldown(acct.UserID, pool.CoolCredit, h.cfg.HardCooldown, "余额不足/未激活")
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 				continue
 			case upstream.ErrSoftRate:
-				h.cfg.Pool.Cooldown(acct.UserID, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
+				h.cfg.Pool.Cooldown(acct.UserID, pool.CoolRate, h.cfg.SoftCooldown, "429 rate limit")
 				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 				continue
 			case upstream.ErrSessionDead:
