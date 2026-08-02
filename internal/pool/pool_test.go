@@ -33,27 +33,71 @@ func addAcct(p *Pool, uid string) {
 	p.Add(mkAuth(uid))
 }
 
-// TestPickRoundRobin 校验 round-robin：全部 healthy 时轮流选到，且不重复选同一账号。
-func TestPickRoundRobin(t *testing.T) {
+// TestPickSticky 校验黏性选号：全部 healthy 时持续复用同一账号（不轮换）。
+func TestPickSticky(t *testing.T) {
 	p := testPool(t)
 	addAcct(p, "1")
 	addAcct(p, "2")
 	addAcct(p, "3")
-	seen := map[string]int{}
-	for i := 0; i < 9; i++ {
+	first := p.Pick()
+	if first == nil {
+		t.Fatal("nil first pick")
+	}
+	// 后续 8 次应始终返回同一账号（黏性，不轮换）
+	for i := 0; i < 8; i++ {
 		a := p.Pick()
 		if a == nil {
 			t.Fatalf("nil pick on iteration %d", i)
 		}
-		seen[a.UserID]++
-	}
-	if len(seen) != 3 {
-		t.Errorf("rotation only saw %v, want all 3", seen)
-	}
-	for uid, n := range seen {
-		if n != 3 {
-			t.Errorf("uid %s picked %d times, want 3 (round-robin)", uid, n)
+		if a.UserID != first.UserID {
+			t.Fatalf("sticky violated: picked %s want %s (iteration %d)", a.UserID, first.UserID, i)
 		}
+	}
+}
+
+// TestPickSwitchesAfterCooldown 校验：当前在用账号冷却后，切换到其他 healthy 号；不选冷却号。
+func TestPickSwitchesAfterCooldown(t *testing.T) {
+	p := testPool(t)
+	addAcct(p, "1")
+	addAcct(p, "2")
+	// 第一次选到某号（黏性锁定）
+	first := p.Pick()
+	if first == nil {
+		t.Fatal("nil first pick")
+	}
+	other := "1"
+	if first.UserID == "1" {
+		other = "2"
+	}
+	// 冷却当前在用账号 → 应切换到另一个 healthy 号
+	p.CooldownCredit(first.UserID, "积分不足")
+	next := p.Pick()
+	if next == nil {
+		t.Fatal("expected switch to healthy account")
+	}
+	if next.UserID == first.UserID {
+		t.Fatalf("picked cooled account %s", next.UserID)
+	}
+	if next.UserID != other {
+		t.Fatalf("picked %s want %s", next.UserID, other)
+	}
+	// 两个都冷却 → nil
+	p.CooldownCredit(other, "积分不足")
+	if got := p.Pick(); got != nil {
+		t.Fatalf("expected nil when all cooled, got %v", got.UserID)
+	}
+}
+
+// TestPickSkipsCooled 校验已冷却账号永不返回（即使曾 active）。
+func TestPickSkipsCooled(t *testing.T) {
+	p := testPool(t)
+	addAcct(p, "1")
+	addAcct(p, "2")
+	// 冷却 2，激活 1
+	p.Cooldown("2", CoolRate, time.Hour, ReasonSoftRate)
+	got := p.Pick()
+	if got == nil || got.UserID != "1" {
+		t.Fatalf("Pick = %v, want uid 1 (skip cooled 2)", got)
 	}
 }
 

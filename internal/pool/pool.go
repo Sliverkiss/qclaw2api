@@ -63,6 +63,7 @@ type entry struct {
 	until    time.Time
 	errCount int
 	lastPick time.Time
+	active   bool // 黏性选号：当前在用账号（healthy 则持续复用）
 
 	// 60rpm 令牌桶（每账号本地保守保护）
 	tokens     float64
@@ -175,19 +176,30 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	}
 }
 
-// Pick 返回 healthy 中 lastPick 最早者（round-robin）；无可用返回 nil。
+// Pick 返回当前在用 healthy 账号；无在用则选一个 healthy 账号并标记为在用（黏性）。
+// 冷却/禁用的账号永不返回。无可用返回 nil。
 func (p *Pool) Pick() *auth.Auth {
 	return p.PickExcluding(nil)
 }
 
 // PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
-// 持写锁：末尾会更新 best.lastPick（RLock 下写属数据竞争）。
+// 黏性策略：若已有 active 账号且 healthy 且未被 tried → 直接返回它（持续复用，不轮换）；
+// 否则在剩余 healthy 候选中选一个并标记为 active。已冷却/禁用账号永不返回。
+// 持写锁：末尾会更新 active/lastPick。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
 
-	// 候选：healthy 且未被 tried
+	// 黏性：当前在用账号 healthy 且未被 tried → 持续复用
+	for _, e := range p.byUID {
+		if e.active && e.healthy(now) && (tried == nil || !tried[e.a.UserID]) {
+			e.lastPick = now
+			return e.a
+		}
+	}
+
+	// 否则在 healthy 候选中选一个（fallback 顺序：原 round-robin 语义）
 	cand := make([]*entry, 0, len(p.byUID))
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
@@ -201,14 +213,13 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 	if len(cand) == 0 {
 		return nil
 	}
-
-	// round-robin：候选中选 lastPick 最早者
 	var best *entry
 	for _, e := range cand {
 		if best == nil || e.lastPick.Before(best.lastPick) {
 			best = e
 		}
 	}
+	best.active = true
 	best.lastPick = now
 	return best.a
 }
@@ -252,6 +263,7 @@ func (p *Pool) CooldownCredit(uid, reason string) {
 		e.reason = reason
 		e.coolKind = CoolCredit
 		e.errCount = 0
+		e.active = false // 冷却后不再是当前在用账号，下次选号切换到其他 healthy 号
 	}
 	p.saveLocked()
 }
@@ -265,6 +277,7 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 		e.reason = reason
 		e.coolKind = kind // F7：记录冷却类型，供积分刷新判断是否可解冻
 		e.errCount = 0
+		e.active = false // 冷却后切换账号
 	}
 	p.saveLocked()
 }
@@ -278,6 +291,7 @@ func (p *Pool) Disable(uid, reason string) {
 		e.reason = reason
 		e.coolKind = 0
 		e.until = time.Time{}
+		e.active = false // 禁用后不再选号
 	}
 	p.saveLocked()
 }
@@ -337,6 +351,7 @@ func (p *Pool) NoteError(uid string) {
 			e.reason = ReasonErr
 			e.coolKind = CoolErr
 			e.errCount = 0
+			e.active = false // 连续错误冷却后切换账号
 		}
 	}
 	p.saveLocked()

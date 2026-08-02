@@ -138,7 +138,9 @@ func (c *Client) SetChatURL(u string) { c.chatURL = u }
 // defaultSystem 是缺失 system role 时前插的默认 system 文案（覆盖网关 CodeBuddy 注入）。
 const defaultSystem = "You are a helpful assistant."
 
-// hasSystemRole 检查 messages 是否已含 system role。
+// hasSystemRole 检查 messages 是否已含**非空** system role。
+// 实测（2026-08-02）：system 缺失 → 400 invalid request；system content 为空字符串 → 同样 400。
+// 因此空 content 的 system 视为「无有效 system」，需注入默认值。
 func hasSystemRole(messages []any) bool {
 	for _, mi := range messages {
 		m, ok := mi.(map[string]any)
@@ -146,13 +148,15 @@ func hasSystemRole(messages []any) bool {
 			continue
 		}
 		if r, _ := m["role"].(string); r == "system" {
-			return true
+			if c, _ := m["content"].(string); c != "" {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-// ensureSystem 在 messages 缺 system 时前插默认 system。
+// ensureSystem 在 messages 缺有效 system 时前插默认 system。
 func ensureSystem(messages []any) []any {
 	if hasSystemRole(messages) {
 		return messages
