@@ -1,4 +1,4 @@
-// login.go — QClaw 微信扫码 OAuth 登录（jprx 4050 → 授权 URL → 4026 → 4055 → 4110）。
+// login.go — QClaw 微信扫码 OAuth 登录（jprx 4050 → 授权 URL → 4026 → 4055 → 4320）。
 //
 // 两个子命令，由 login.sh 顺序驱动：
 //
@@ -6,7 +6,7 @@
 //	                   {state,guid} 落 /tmp/qclaw-login-state.json，stdout 打印 URL
 //	login code <arg> → 读 state，解析 arg（含 code= 提取，否则整体当 code），
 //	                   POST 4026 → is_new_user 分支(exit 2) → 4055 sk-apiKey
-//	                   → 4110 Q 点 → stdout 打印完整 auth JSON（嵌套形）
+//	                   → 4320 模型列表 → 写 ./data/models.json → stdout 打印完整 auth JSON（嵌套形）
 //
 // 注意：本程序不落盘 auths/（由 login.sh 用 python3 解析 stdout 后落盘）。
 package main
@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -30,7 +31,56 @@ const (
 	wxAuthURL  = "https://open.weixin.qq.com/connect/qrconnect?appid=%s&redirect_uri=%s&response_type=code&scope=snsapi_login&state=%s#wechat_redirect"
 	wxAppID    = "wx9d11056dd75b7240"
 	wxRedirect = "https%3A%2F%2Fsecurity.guanjia.qq.com%2Flogin"
+	// modelsFile 模型列表落盘路径（SPEC §2.6），env QC2A_MODELS_FILE 可覆盖。
+	modelsFile = "./data/models.json"
 )
+
+// modelsFilePath 读 QC2A_MODELS_FILE env，缺省 ./data/models.json。
+func modelsFilePath() string {
+	if v := os.Getenv("QC2A_MODELS_FILE"); v != "" {
+		return v
+	}
+	return modelsFile
+}
+
+// writeModelsFile 把 4320 模型列表包装成 OpenAI /v1/models 形状，原子写（tmp+rename）0644。
+// 失败返回错误（调用方仅警告，不阻塞登录）。
+func writeModelsFile(path string, ms *jprx.ModelStatus) error {
+	items := make([]map[string]any, 0, len(ms.ModelStatusList))
+	for _, m := range ms.ModelStatusList {
+		if m.ID == "" {
+			continue
+		}
+		items = append(items, map[string]any{
+			"id":       m.ID,
+			"object":   "model",
+			"created":  1753600000,
+			"owned_by": "qclaw",
+		})
+	}
+	if len(items) == 0 {
+		return fmt.Errorf("4320: empty model list, skip write")
+	}
+	doc := map[string]any{
+		"object":     "list",
+		"updated_at": time.Now().Unix(),
+		"data":       items,
+	}
+	raw, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", dir, err)
+		}
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
 
 // loginState 落盘状态。
 type loginState struct {
@@ -56,9 +106,11 @@ func main() {
 	if len(os.Args) < 2 {
 		fatal("usage: login <url|code> [arg]")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	c := jprx.New()
+	// 仅登录链路开启 X-New-Token 捕获（4055/4320 若返回新 JWT 会覆盖内存值并落盘）
+	c.SetCaptureNewToken(true)
 
 	switch os.Args[1] {
 	case "url":
@@ -119,10 +171,13 @@ func main() {
 			a.SKAPIKey = key.Key
 		}
 
-		// 4110 Q 点余额（展示用，失败不阻塞）
-		balance := float64(-1)
-		if qb, err := c.GetQBalance(ctx, a); err == nil {
-			balance = qb.Balance
+		// 4320 模型列表 → 写 ./data/models.json（失败仅警告，保留旧文件；SPEC §2.6）
+		if ms, err := c.GetModelStatus(ctx, a); err == nil {
+			if werr := writeModelsFile(modelsFilePath(), ms); werr != nil {
+				fmt.Fprintf(os.Stderr, "警告: 写模型文件失败: %v（运行期回退内置静态表）\n", werr)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "警告: 4320 获取模型列表失败: %v（运行期回退内置静态表）\n", err)
 		}
 
 		out := map[string]any{
@@ -137,7 +192,6 @@ func main() {
 				"user_id":  a.UserID,
 				"nickname": a.Nickname,
 			},
-			"q_balance": balance,
 		}
 		oraw, _ := json.Marshal(out)
 		fmt.Println(string(oraw))

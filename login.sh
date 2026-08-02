@@ -4,14 +4,14 @@
 # 用法:
 #   ./login.sh
 #
-# 流程（SPEC §3.2）:
+# 流程（SPEC §2.6）:
 #   1. ./login url  → 4050 拿 state → 打印微信授权 URL
 #   2. 你在浏览器/手机打开 URL 扫码完成登录
 #   3. 浏览器会回调到 https://security.guanjia.qq.com/login?code=...&state=...
 #   4. 把完整回调 URL（或 code 本身）粘贴回终端
 #   5. ./login code <arg> → 4026 登录 → is_new_user 判定 → 4055 生成 sk-apiKey
-#      → 4110 积分 → stdout 完整 auth JSON
-#   6. python3 解析落盘 auths/qclaw-<user_id>.json → 打印积分 → docker restart
+#      → 4320 模型列表 → 写 ./data/models.json → stdout 完整 auth JSON
+#   6. python3 解析落盘 auths/qclaw-<user_id>.json → docker restart
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -73,7 +73,6 @@ fi
 # 解析完整 auth JSON（与 internal/auth 读取格式一致）
 USER_ID=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['account']['user_id'])")
 NICKNAME=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin)['account'].get('nickname',''))")
-Q_BALANCE=$(echo "$RESULT" | python3 -c "import json,sys; print(json.load(sys.stdin).get('q_balance','?'))")
 
 if [[ -z "$USER_ID" ]]; then
     echo "无法获取 user_id，登录结果异常"
@@ -92,8 +91,6 @@ fi
 echo "$RESULT" | python3 -c "
 import json, sys
 auth = json.load(sys.stdin)
-# 去掉 q_balance（运行时展示字段，不属于 auth 文件格式）
-auth.pop('q_balance', None)
 with open('$AUTH_FILE', 'w') as f:
     json.dump(auth, f, indent=2)
 " || {
@@ -101,13 +98,9 @@ with open('$AUTH_FILE', 'w') as f:
     exit 1
 }
 chmod 600 "$AUTH_FILE"
-# 容器内 app 用户(uid 10001) 需可写 auth 文件（refresh 落盘 X-New-Token）
+# 容器内 app 用户(uid 10001) 需可写 auth 文件（登录捕获 X-New-Token 落盘）
 chown 10001:10001 "$AUTH_FILE" 2>/dev/null || true
 echo "已保存（$ACTION）: $AUTH_FILE"
-
-# ─── 打印积分摘要 ────────────────────────────────────────────
-echo ""
-echo "Q 点余额: ${Q_BALANCE:-?}"
 
 # ─── 重启服务 ────────────────────────────────────────────
 echo ""
@@ -126,5 +119,4 @@ echo "============================================================"
 echo "  登录完成！"
 echo "  UserID: $USER_ID"
 echo "  Nickname: ${NICKNAME:-（未获取到）}"
-echo "  Q 点: ${Q_BALANCE:-?}"
 echo "============================================================"
