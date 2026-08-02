@@ -207,7 +207,34 @@ func TestRecover(t *testing.T) {
 	}
 }
 
-// TestCoolingUIDs 校验返回冷却中未禁用账号。
+// TestRecoverRestoresActive 校验 Recover 恢复 active=true（P0-2）：
+// keepalive 探测通过后恢复的账号应重新成为在用（黏性），连续 Pick 返回该账号；
+// 若 Recover 未恢复 active，恢复的账号会跌入 fallback 被其他 healthy 号抢占（横跳）。
+func TestRecoverRestoresActive(t *testing.T) {
+	p := testPool(t)
+	addAcct(p, "1")
+	addAcct(p, "2")
+	// 锁定 uid1 为在用账号（排除 uid2，冷却期间不选号 → uid2 不会成为 active）
+	if got := p.PickExcluding(map[string]bool{"2": true}); got == nil || got.UserID != "1" {
+		t.Fatalf("PickExcluding = %v, want uid1", got)
+	}
+	p.CooldownCredit("1", "积分不足")
+	p.Recover("1") // keepalive 探测通过，立即恢复
+	// 恢复后 active 恢复 → 连续 Pick 持续返回 uid1（黏性不横跳）
+	for i := 0; i < 5; i++ {
+		a := p.Pick()
+		if a == nil {
+			t.Fatalf("nil pick on iteration %d", i)
+		}
+		if a.UserID != "1" {
+			t.Fatalf("recovered account not sticky (P0-2): picked %s want 1 (iteration %d)",
+				a.UserID, i)
+		}
+	}
+}
+
+// TestCoolingUIDs 校验只返回积分冷却（CoolCredit）未禁用账号。
+// 短冷却（CoolRate/CoolErr）时间自愈，keepalive 不探测（P0-3）。
 func TestCoolingUIDs(t *testing.T) {
 	p := testPool(t)
 	addAcct(p, "1")
@@ -217,11 +244,8 @@ func TestCoolingUIDs(t *testing.T) {
 	p.Cooldown("2", CoolRate, time.Minute, ReasonSoftRate)
 	p.Disable("3", ReasonDisabled)
 	got := p.CoolingUIDs()
-	if len(got) != 2 {
-		t.Fatalf("CoolingUIDs = %v, want [1 2]", got)
-	}
-	if got[0] != "1" || got[1] != "2" {
-		t.Errorf("CoolingUIDs = %v, want [1 2] (disabled excluded)", got)
+	if len(got) != 1 || got[0] != "1" {
+		t.Fatalf("CoolingUIDs = %v, want [1] (only credit cooldown, disabled excluded)", got)
 	}
 }
 

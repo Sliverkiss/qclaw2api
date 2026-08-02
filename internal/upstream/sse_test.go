@@ -177,7 +177,15 @@ func TestClassify(t *testing.T) {
 	}{
 		{401, `{"error":"invalid_api_key"}`, ErrSessionDead},
 		{403, `{"error":"api_key_inactive"}`, ErrInactive},
+		// P1-8：api_key_inactive 与余额关键词并存时，inactive 优先。
+		{403, `{"error":"api_key_inactive: 余额不足，请充值"}`, ErrInactive},
 		{403, `{"error":"insufficient credit"}`, ErrHardCredit},
+		// P1-3：中文余额/停用文案。
+		{402, `{"error":"欠费，请充值"}`, ErrHardCredit},
+		{402, `{"error":"余额为 0"}`, ErrHardCredit},
+		{402, `{"error":"余额为0"}`, ErrHardCredit},
+		{402, `{"error":"余额为零"}`, ErrHardCredit},
+		{402, `{"error":"账号已停用"}`, ErrHardCredit},
 		{429, `{"error":"rate limited"}`, ErrSoftRate},
 		{500, `internal error`, ErrServer},
 		{400, `invalid request`, ErrClient},

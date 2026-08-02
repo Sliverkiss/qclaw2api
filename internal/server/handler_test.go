@@ -270,6 +270,59 @@ func TestModelsStaticFallback(t *testing.T) {
 	}
 }
 
+// TestModelsReloadFallbackCached 校验（P1-7）：models.json 损坏 → 回退 staticModels，
+// 且 mtime 被记录为当前文件 ModTime，后续 list() 不再重复读盘重试（读放大消除）。
+func TestModelsReloadFallbackCached(t *testing.T) {
+	aiz := &fakeAizone{status: 200, body: ""}
+	fp := writeModelsFile(t, "default")
+	// 写坏内容（覆盖有效 JSON）
+	if err := os.WriteFile(fp, []byte("{broken"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h, _ := newTestHandler(t, aiz, fp)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	// 首次触发 reload（启动时已加载成功，此处改文件 mtime 触发 reload 失败 → 回退）
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Data []map[string]any `json:"data"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+	if len(out.Data) != len(staticModels) {
+		t.Fatalf("broken file should fallback to static, got %d models", len(out.Data))
+	}
+
+	// 再次请求应走缓存（mtime 已锁），仍回退 static 且不因读盘失败反复重试
+	req2, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/models", nil)
+	req2.Header.Set("Authorization", "Bearer "+testAPIKey)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp2.Body.Close()
+	var out2 struct {
+		Data []map[string]any `json:"data"`
+	}
+	_ = json.NewDecoder(resp2.Body).Decode(&out2)
+	if len(out2.Data) != len(staticModels) {
+		t.Errorf("second request = %d models, want static fallback", len(out2.Data))
+	}
+	// mtime 已锁定为损坏文件当前 ModTime（非 zero），避免每次 stat 不一致
+	h.modelStore.mu.RLock()
+	locked := !h.modelStore.mtime.IsZero()
+	h.modelStore.mu.RUnlock()
+	if !locked {
+		t.Errorf("mtime not recorded after fallback (P1-7), read amplification persists")
+	}
+}
+
 // TestStatus 校验 /status 返回账号列表。
 func TestStatus(t *testing.T) {
 	aiz := &fakeAizone{status: 200, body: ""}

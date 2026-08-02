@@ -3,6 +3,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -54,22 +55,23 @@ func (s *modelsStore) list() []map[string]any {
 	return s.data
 }
 
-// reload 读取 models.json（OpenAI /v1/models 形状）并缓存；失败回退 staticModels。
+// reload 读取 models.json（OpenAI /v1/models 形状）并缓存；失败回退 staticModels，
+// 并把 mtime 更新为当前 stat ModTime，避免每次 list() 因 mtime 不一致重复读盘（P1-7）。
 func (s *modelsStore) reload() {
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
-		log.Printf("models_store: read %s: %v (fallback to static)", s.path, err)
+		s.fallback(err)
 		return
 	}
 	var doc struct {
 		Data []map[string]any `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		log.Printf("models_store: parse %s: %v (fallback to static)", s.path, err)
+		s.fallback(err)
 		return
 	}
 	if len(doc.Data) == 0 {
-		log.Printf("models_store: %s has empty data (fallback to static)", s.path)
+		s.fallback(fmt.Errorf("empty data"))
 		return
 	}
 	fi, err := os.Stat(s.path)
@@ -79,5 +81,18 @@ func (s *modelsStore) reload() {
 	s.mu.Lock()
 	s.data = doc.Data
 	s.mtime = fi.ModTime()
+	s.mu.Unlock()
+}
+
+// fallback 回退 staticModels 并记录当前文件 ModTime（防止持续重读）。
+func (s *modelsStore) fallback(cause error) {
+	log.Printf("models_store: %s: %v (fallback to static)", s.path, cause)
+	var mtime time.Time
+	if fi, err := os.Stat(s.path); err == nil {
+		mtime = fi.ModTime()
+	}
+	s.mu.Lock()
+	s.data = staticModels
+	s.mtime = mtime
 	s.mu.Unlock()
 }

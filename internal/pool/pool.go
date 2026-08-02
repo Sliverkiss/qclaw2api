@@ -191,12 +191,24 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 	defer p.mu.Unlock()
 	now := time.Now()
 
-	// 黏性：当前在用账号 healthy 且未被 tried → 持续复用
+	// 黏性：当前在用账号 healthy 且未被 tried → 持续复用。
+	// 多 active（异常态）时选 lastPick 最早者，确定性避免 map 随机（P1-1）。
+	var activeBest *entry
 	for _, e := range p.byUID {
-		if e.active && e.healthy(now) && (tried == nil || !tried[e.a.UserID]) {
-			e.lastPick = now
-			return e.a
+		if !e.active || !e.healthy(now) {
+			continue
 		}
+		if tried != nil && tried[e.a.UserID] {
+			continue
+		}
+		if activeBest == nil || e.lastPick.Before(activeBest.lastPick) ||
+			(e.lastPick.Equal(activeBest.lastPick) && e.a.UserID < activeBest.a.UserID) {
+			activeBest = e
+		}
+	}
+	if activeBest != nil {
+		activeBest.lastPick = now
+		return activeBest.a
 	}
 
 	// 否则在 healthy 候选中选一个（fallback 顺序：原 round-robin 语义）
@@ -309,14 +321,15 @@ func (p *Pool) ClearCooldown(uid string) {
 	p.saveLocked()
 }
 
-// CoolingUIDs 返回冷却中且未禁用的账号 uid（scheduler keepalive 探测用）。
+// CoolingUIDs 返回积分冷却（CoolCredit）且未禁用的账号 uid（scheduler keepalive 探测用）。
+// 只返回 CoolCredit：CoolRate(60s)/CoolErr(10m) 短冷却由时间自愈，无需探测提前解冻（P0-3）。
 func (p *Pool) CoolingUIDs() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
 	var uids []string
 	for uid, e := range p.byUID {
-		if e.disabled {
+		if e.disabled || e.coolKind != CoolCredit {
 			continue
 		}
 		if !e.until.IsZero() && now.Before(e.until) {
@@ -336,6 +349,7 @@ func (p *Pool) Recover(uid string) {
 		e.reason = ""
 		e.coolKind = 0
 		e.errCount = 0
+		e.active = true // 恢复在用身份，避免黏性断裂反复横跳（P0-2）
 	}
 	p.saveLocked()
 }

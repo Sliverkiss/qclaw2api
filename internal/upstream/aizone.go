@@ -63,6 +63,8 @@ var balanceMarkers = []string{
 	"insufficient credit", "no credit", "credit exhausted", "out of credit",
 	"quota exceeded", "payment required", "credit not enough",
 	"积分不足", "额度不足", "余额不足", "积分用完", "额度用尽",
+	// 中文常见文案（P1-3）；「余额为 0/0」两种空格形态都覆盖，匹配保持大小写不敏感。
+	"欠费", "余额为0", "余额为 0", "余额为零", "已停用",
 }
 
 // inactiveMarkers 账号未激活类关键词 → ErrInactive（固定短冷却，非余额问题）。
@@ -71,17 +73,18 @@ var inactiveMarkers = []string{"api_key_inactive"}
 var sessionDeadMarkers = []string{"invalid_api_key", "21004", "登录已过期"}
 
 // Classify 按 HTTP 状态码 + body 判定错误类别（SPEC §2.3）。
-// 顺序：balanceMarkers → inactiveMarkers → sessionDeadMarkers → 429 → 5xx → 其余 4xx。
+// 顺序：inactiveMarkers → balanceMarkers → sessionDeadMarkers → 429 → 5xx → 其余 4xx。
+// inactiveMarkers 前置（P1-8）：api_key_inactive 错误体可能同时含余额关键词，先判未激活。
 func Classify(status int, body string) ErrKind {
 	lower := strings.ToLower(body)
-	for _, m := range balanceMarkers {
-		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
-			return ErrHardCredit
-		}
-	}
 	for _, m := range inactiveMarkers {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
 			return ErrInactive
+		}
+	}
+	for _, m := range balanceMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
+			return ErrHardCredit
 		}
 	}
 	for _, m := range sessionDeadMarkers {
@@ -202,6 +205,9 @@ func (c *Client) ChatStream(ctx context.Context, a *auth.Auth, body []byte) (rc 
 		return nil, 0, nil, err
 	}
 	aizoneHeaders(req.Header, a)
+	// 强制 identity：禁用 gzip/deflate，确保上游 SSE 分帧原样传输（P1-6）。
+	// 压缩层会把 SSE 事件缓冲成整块，破坏流式逐帧 flush。
+	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := c.chatHTTP.Do(req)
 	if err != nil {
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UserID, err)
