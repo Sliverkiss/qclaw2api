@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 )
 
 const (
@@ -167,28 +166,6 @@ func TestSaveAtomicNoPath(t *testing.T) {
 	}
 }
 
-// TestNeedsRefresh 校验过期判断。
-func TestNeedsRefresh(t *testing.T) {
-	now := time.Now().Unix()
-	cases := []struct {
-		name   string
-		exp    int64
-		within time.Duration
-		want   bool
-	}{
-		{"expired", now - 10, time.Hour, true},
-		{"expires within skew", now + 3*24*3600, 7 * 24 * time.Hour, true},
-		{"expires far", now + 20*24*3600, 7 * 24 * time.Hour, false},
-		{"no expiry", 0, 7 * 24 * time.Hour, true},
-	}
-	for _, c := range cases {
-		a := &Auth{ExpiresAt: c.exp}
-		if got := a.NeedsRefresh(c.within); got != c.want {
-			t.Errorf("%s: NeedsRefresh(%v) = %v, want %v", c.name, c.within, got, c.want)
-		}
-	}
-}
-
 // TestLoadDir 校验 glob qclaw-*.json 与解析过滤。
 func TestLoadDir(t *testing.T) {
 	dir := t.TempDir()
@@ -234,7 +211,7 @@ func TestLoadDirMissing(t *testing.T) {
 }
 
 // TestSnapshotConcurrent 校验 JWTToken 并发写读无数据竞争（F4）。
-// 模拟 captureNewToken 持锁写 vs SnapshotJWT/SnapshotExpires 无锁读侧。
+// 模拟 captureNewToken 持锁写 vs SnapshotJWT 无锁读侧。
 func TestSnapshotConcurrent(t *testing.T) {
 	a := &Auth{
 		JWTToken:  "jwt-a",
@@ -252,14 +229,13 @@ func TestSnapshotConcurrent(t *testing.T) {
 			a.Unlock()
 		}
 	}()
-	// 读侧：快照读（NeedsRefresh 内部也走 SnapshotExpires）
+	// 读侧：快照读
 	for g := 0; g < 4; g++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
 				_ = a.SnapshotJWT()
-				_ = a.NeedsRefresh(7 * 24 * time.Hour)
 			}
 		}()
 	}

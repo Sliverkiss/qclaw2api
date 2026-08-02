@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	"qclaw2api/internal/auth"
 )
@@ -432,7 +431,7 @@ func TestSignHeaders(t *testing.T) {
 	}
 }
 
-// TestConcurrentSignAndCapture 校验 captureNewToken 持锁写 vs signHeaders/NeedsRefresh
+// TestConcurrentSignAndCapture 校验 captureNewToken 持锁写 vs signHeaders
 // 无锁读侧并发无数据竞争（F4）。
 func TestConcurrentSignAndCapture(t *testing.T) {
 	a, _ := newTestAuth(t)
@@ -449,7 +448,7 @@ func TestConcurrentSignAndCapture(t *testing.T) {
 			_ = captureNewToken(h, a)
 		}
 	}()
-	// 读侧：signHeaders + NeedsRefresh 无锁直读
+	// 读侧：signHeaders 无锁直读
 	for g := 0; g < 4; g++ {
 		wg.Add(1)
 		go func() {
@@ -459,7 +458,6 @@ func TestConcurrentSignAndCapture(t *testing.T) {
 				if err := signHeaders(h, body, a); err != nil {
 					t.Errorf("signHeaders: %v", err)
 				}
-				_ = a.NeedsRefresh(7 * 24 * time.Hour)
 			}
 		}()
 	}

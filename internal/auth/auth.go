@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 )
 
 // Auth 是归一化后的 QClaw 账号凭证。
@@ -43,22 +42,6 @@ func (a *Auth) SnapshotJWT() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.JWTToken
-}
-
-// SnapshotExpires 持锁返回 ExpiresAt 副本，供 NeedsRefresh 等读侧使用。
-func (a *Auth) SnapshotExpires() int64 {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.ExpiresAt
-}
-
-// NeedsRefresh 报告 token 是否将在 within 内过期（或已过期/无 expiry）。
-func (a *Auth) NeedsRefresh(within time.Duration) bool {
-	exp := a.SnapshotExpires()
-	if exp <= 0 {
-		return true
-	}
-	return time.Now().Add(within).Unix() >= exp
 }
 
 // Parse 兼容两种磁盘形态：嵌套形 {auth,account} 与扁平形（字段平铺）。
