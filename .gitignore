@@ -4,6 +4,7 @@ data/
 config.json
 .env
 docs/
+.omh/
 *.tmp
 
 # 构建产物与临时文件
