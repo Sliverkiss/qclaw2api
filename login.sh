@@ -107,8 +107,27 @@ echo ""
 if docker ps --format '{{.Names}}' | grep -q "^${CONTAINER}$"; then
     echo "重启 $CONTAINER 加载新账号..."
     docker restart "$CONTAINER" >/dev/null
-    sleep 2
-    COUNT=$(curl -s http://127.0.0.1:7865/status -H "Authorization: Bearer ${API_KEY:-change-me}" 2>/dev/null | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null || echo "?")
+
+    # 读取真实对外鉴权 key：优先 env QC2A_API_KEY，其次 .env，其次 config.json
+    AUTH_KEY="${QC2A_API_KEY:-}"
+    if [[ -z "$AUTH_KEY" && -f .env ]]; then
+        AUTH_KEY=$(grep -E '^QC2A_API_KEY=' .env | head -1 | cut -d= -f2- | tr -d '"'"'"' \r')
+    fi
+    if [[ -z "$AUTH_KEY" && -f config.json ]]; then
+        AUTH_KEY=$(python3 -c "import json;print(json.load(open('config.json')).get('api_key',''))" 2>/dev/null || true)
+    fi
+    AUTH_KEY="${AUTH_KEY:-change-me}"
+
+    # 等待服务就绪（最多 30s），避免重启未完成时查询误报 0
+    COUNT="?"
+    for _ in $(seq 1 30); do
+        sleep 1
+        RESP=$(curl -s http://127.0.0.1:7865/status -H "Authorization: Bearer ${AUTH_KEY}" 2>/dev/null || true)
+        if [[ -n "$RESP" && "$RESP" != *"error"* ]]; then
+            COUNT=$(echo "$RESP" | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null || echo "?")
+            break
+        fi
+    done
     echo "服务已重启，当前账号数: $COUNT"
 else
     echo "容器 $CONTAINER 未运行，auth 文件已保存，下次启动自动加载"

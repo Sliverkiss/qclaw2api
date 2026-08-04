@@ -2,6 +2,7 @@
 auths/
 data/
 config.json
+.env
 docs/
 *.tmp
 
