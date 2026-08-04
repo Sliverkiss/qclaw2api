@@ -30,7 +30,7 @@ type Scheduler struct {
 // New 创建调度器。
 func New(cfg Config) *Scheduler {
 	if len(cfg.KeepaliveHours) == 0 {
-		cfg.KeepaliveHours = []int{4}
+		cfg.KeepaliveHours = []int{0} // R3：默认中国时区 0 点
 	}
 	return &Scheduler{cfg: cfg, now: time.Now}
 }
@@ -76,7 +76,8 @@ func contains(hours []int, h int) bool {
 	return false
 }
 
-// RunKeepaliveNow 立即对冷却中账号做对话探测：成功 Recover，失败滚动重冷却。
+// RunKeepaliveNow 立即对冷却中账号做对话探测：成功 Recover，失败保持冷却。
+// R3：冷却无到期——探测失败不滚动 CooldownCredit，账号保持冷却直到下次探测通过。
 // 禁用账号跳过。当日去重由调用方（tick/Run）负责。
 func (s *Scheduler) RunKeepaliveNow(ctx context.Context, dayKey string) {
 	s.mu.Lock()
@@ -93,10 +94,9 @@ func (s *Scheduler) RunKeepaliveNow(ctx context.Context, dayKey string) {
 			s.cfg.Pool.Recover(uid)
 			log.Printf("keepalive: uid=%s probe OK, recovered", uid)
 		} else {
-			// R3：探测失败 → 重新 CooldownCredit，冷却滚动到再下一天 0 点，
-			// 不要死等到下月1号。次日 0 点到期后 keepalive 再次探测。
-			s.cfg.Pool.CooldownCredit(uid, "积分不足，keepalive 探测失败")
-			log.Printf("keepalive: uid=%s probe fail, roll cooldown to next midnight: %v", uid, err)
+			// R3：探测失败 → 保持冷却，只 log（不调 CooldownCredit 滚动）。
+			// 冷却无到期，恢复完全由后续 keepalive 探测决定。
+			log.Printf("keepalive: uid=%s probe fail, stay cooling: %v", uid, err)
 		}
 	}
 }

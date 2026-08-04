@@ -82,7 +82,8 @@ func TestRunKeepaliveProbeRecovers(t *testing.T) {
 	}
 }
 
-// TestRunKeepaliveProbeFail 校验探测失败 → 保持冷却且 until 滚动到次日 0 点（R3）。
+// TestRunKeepaliveProbeFail 校验探测失败 → 保持冷却不滚动（R3：冷却无到期）。
+// 账号保留 cooling 状态（不 Recover），下次 keepalive 继续探测。
 func TestRunKeepaliveProbeFail(t *testing.T) {
 	rec := newProbeRecorder()
 	rec.errByID["1"] = errors.New("upstream 402 credit")
@@ -99,10 +100,9 @@ func TestRunKeepaliveProbeFail(t *testing.T) {
 	if !st.Cooling {
 		t.Errorf("uid1 should stay cooling after probe fail: %+v", st)
 	}
-	// R3：失败后重新 CooldownCredit——until 保持为次日 0 点（滚动目标由 CooldownCredit 保证，
-	// 见 TestNextMidnight 边界）。账号仍不可选。
-	if !st.Until.Equal(pool.NextMidnight(time.Now())) {
-		t.Errorf("until = %v, want next midnight %v", st.Until, pool.NextMidnight(time.Now()))
+	// R3：失败只 log，不重新 CooldownCredit——until 保持零值（无到期滚动）。
+	if !st.Until.IsZero() {
+		t.Errorf("until = %v, want zero (R3 失败不滚动)", st.Until)
 	}
 	if got := p.PickExcluding(map[string]bool{"2": true}); got != nil {
 		t.Fatalf("uid1 must not be pickable while cooling: %v", got)

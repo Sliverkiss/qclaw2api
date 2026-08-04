@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,13 +19,16 @@ import (
 type CoolKind int
 
 const (
-	CoolCredit CoolKind = iota // 积分不足 → 冷却至下月1号（keepalive 探测恢复）
-	CoolRate                   // 429 / rpm 超限 → 短冷却
-	CoolErr                    // 连续错误 / api_key_inactive → 中冷却
+	CoolNone   CoolKind = 0 // 无冷却（新账号默认态）
+	CoolCredit CoolKind = 1 // 积分不足 → keepalive 探测恢复（R3：无到期）
+	CoolRate   CoolKind = 2 // 429 / rpm 超限 → 短冷却
+	CoolErr    CoolKind = 3 // 连续错误 / api_key_inactive → 中冷却
 )
 
 func (k CoolKind) String() string {
 	switch k {
+	case CoolNone:
+		return "none"
 	case CoolCredit:
 		return "credit"
 	case CoolRate:
@@ -72,6 +76,11 @@ type entry struct {
 
 func (e *entry) healthy(now time.Time) bool {
 	if e.disabled {
+		return false
+	}
+	// R3：积分冷却无到期——coolKind==CoolCredit 永远不健康（不管 until），
+	// 只有 keepalive 探测通过 Recover 清除 coolKind 才恢复。
+	if e.coolKind == CoolCredit {
 		return false
 	}
 	if !e.until.IsZero() && now.Before(e.until) {
@@ -261,7 +270,7 @@ func (p *Pool) ReserveToken(uid string) bool {
 
 // NextMonthStart 返回 now 所在月份的下月 1 号 00:00（本地时区）。
 // time.Date 自动处理跨年（12 月 → 次年 1 月）。
-// 保留仅供历史 state.json 语义参考；新 CooldownCredit 走 NextMidnight。
+// 保留仅供历史 state.json 语义参考；新 CooldownCredit 无到期（R3）。
 func NextMonthStart(now time.Time) time.Time {
 	y, m, _ := now.Date()
 	return time.Date(y, m+1, 1, 0, 0, 0, 0, now.Location())
@@ -269,19 +278,19 @@ func NextMonthStart(now time.Time) time.Time {
 
 // NextMidnight 返回 now 的次日 0 点（本地时区，容器为 Asia/Shanghai）。
 // time.Date 自动处理跨月/跨年（8-31 → 9-1，12-31 → 次年 1-1）。
-// 积分不足冷却滚动目标（R3）：每日 0 点 allow 冷却到期，keepalive 每日探测。
+// 已废弃（R3）：积分冷却不再滚动 until，冷却无到期、恢复由 keepalive 探测决定。
+// 保留仅供历史 state.json 语义参考。
 func NextMidnight(now time.Time) time.Time {
 	y, m, d := now.Date()
 	return time.Date(y, m, d+1, 0, 0, 0, 0, now.Location())
 }
 
-// CooldownCredit 积分不足冷却至次日 0 点（中国时区），由 keepalive 每日探测恢复；
-// 探测失败 → 再次 CooldownCredit 滚动到再下一天 0 点（R3）。
+// CooldownCredit 积分不足冷却（R3：无到期）：只设 coolKind=CoolCredit + reason，
+// 不设 until —— 冷却永不自动恢复，恢复完全由 keepalive 每日探测决定（成功 Recover）。
 func (p *Pool) CooldownCredit(uid, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		e.until = NextMidnight(time.Now())
 		e.reason = reason
 		e.coolKind = CoolCredit
 		e.errCount = 0
@@ -311,7 +320,7 @@ func (p *Pool) Disable(uid, reason string) {
 	if e, ok := p.byUID[uid]; ok {
 		e.disabled = true
 		e.reason = reason
-		e.coolKind = 0
+		e.coolKind = CoolNone
 		e.until = time.Time{}
 		e.active = false // 禁用后不再选号
 	}
@@ -325,26 +334,25 @@ func (p *Pool) ClearCooldown(uid string) {
 	if e, ok := p.byUID[uid]; ok {
 		e.until = time.Time{}
 		e.reason = ""
-		e.coolKind = 0
+		e.coolKind = CoolNone
 		e.errCount = 0
 	}
 	p.saveLocked()
 }
 
-// CoolingUIDs 返回积分冷却（CoolCredit）且未禁用的账号 uid（scheduler keepalive 探测用）。
+// CoolingUIDs 返回所有积分冷却（CoolCredit）且未禁用的账号 uid（scheduler keepalive 探测用）。
+// R3：冷却无到期，不按 until 过滤——只要 coolKind==CoolCredit 且未禁用就返回，
+// keepalive 每日 0 点探测全部，成功 Recover、失败保持冷却（下次探测）。
 // 只返回 CoolCredit：CoolRate(60s)/CoolErr(10m) 短冷却由时间自愈，无需探测提前解冻（P0-3）。
 func (p *Pool) CoolingUIDs() []string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	now := time.Now()
 	var uids []string
 	for uid, e := range p.byUID {
 		if e.disabled || e.coolKind != CoolCredit {
 			continue
 		}
-		if !e.until.IsZero() && now.Before(e.until) {
-			uids = append(uids, uid)
-		}
+		uids = append(uids, uid)
 	}
 	sort.Strings(uids)
 	return uids
@@ -357,7 +365,7 @@ func (p *Pool) Recover(uid string) {
 	if e, ok := p.byUID[uid]; ok {
 		e.until = time.Time{}
 		e.reason = ""
-		e.coolKind = 0
+		e.coolKind = CoolNone
 		e.errCount = 0
 		e.active = true // 恢复在用身份，避免黏性断裂反复横跳（P0-2）
 	}
@@ -441,10 +449,11 @@ func (p *Pool) List() []Status {
 
 func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
+	// R3：Cooling = coolKind==CoolCredit（无到期）|| until 未过（短冷却/历史数据）。
 	return Status{
 		UID:      uid,
 		Nickname: e.a.Nickname,
-		Cooling:  !e.until.IsZero() && now.Before(e.until),
+		Cooling:  e.coolKind == CoolCredit || (!e.until.IsZero() && now.Before(e.until)),
 		Until:    e.until,
 		Reason:   e.reason,
 		Disabled: e.disabled,
@@ -468,7 +477,7 @@ func (p *Pool) load() {
 	}
 	now := time.Now()
 	for uid, s := range sf.Accounts {
-		p.byUID[uid] = &entry{
+		e := &entry{
 			a:          &auth.Auth{UserID: uid}, // placeholder，Add 时会换成完整凭证
 			disabled:   s.Disabled,
 			reason:     s.Reason,
@@ -478,7 +487,19 @@ func (p *Pool) load() {
 			lastRefill: now,
 			tokens:     float64(p.rpm),
 		}
+		// 旧 state.json 兼容：旧积分冷却 cool_kind=0（CoolHard）且 reason 含 credit/积分 → 映射为 CoolCredit。
+		// 新枚举 CoolNone=0 表示无冷却，不能把遗留 until 硬冷却当 CoolCredit 处理。
+		if s.CoolKind == 0 && creditReason(s.Reason) {
+			e.coolKind = CoolCredit
+		}
+		p.byUID[uid] = e
 	}
+}
+
+// creditReason 报告 reason 是否属于积分不足语义（旧 cool_kind=0 映射用）。
+func creditReason(reason string) bool {
+	r := strings.ToLower(reason)
+	return strings.Contains(r, "credit") || strings.Contains(r, "balance") || strings.Contains(r, "积分")
 }
 
 // saveLocked 原子写 state.json（tmp+rename 0600）。

@@ -144,7 +144,8 @@ func TestDisable(t *testing.T) {
 	}
 }
 
-// TestCooldownCredit 校验积分冷却 until = 次日 0 点（R3），且状态类型为 CoolCredit。
+// TestCooldownCredit 校验积分冷却（R3）：无到期——只设 coolKind=CoolCredit + reason，
+// until 保持零值；冷却后一直不可选，直到 Recover 清除 coolKind。
 func TestCooldownCredit(t *testing.T) {
 	p := testPool(t)
 	addAcct(p, "1")
@@ -156,9 +157,8 @@ func TestCooldownCredit(t *testing.T) {
 	if st.Reason != "积分不足" {
 		t.Errorf("reason = %q", st.Reason)
 	}
-	want := NextMidnight(time.Now())
-	if !st.Until.Equal(want) {
-		t.Errorf("until = %v, want NextMidnight=%v", st.Until, want)
+	if !st.Until.IsZero() {
+		t.Errorf("until = %v, want zero (R3 冷却无到期)", st.Until)
 	}
 	// 冷却中不可选
 	if got := p.Pick(); got != nil {
@@ -169,6 +169,31 @@ func TestCooldownCredit(t *testing.T) {
 	p.mu.RUnlock()
 	if kind != CoolCredit {
 		t.Errorf("coolKind = %v, want CoolCredit(%d)", kind, CoolCredit)
+	}
+}
+
+// TestCooldownCreditNoExpiry 校验积分冷却无到期（R3）：CooldownCredit 后账号一直冷却，
+// 即使 until 已过去（历史数据）也不恢复；只有 Recover 清除 coolKind 才恢复。
+func TestCooldownCreditNoExpiry(t *testing.T) {
+	p := testPool(t)
+	addAcct(p, "1")
+	addAcct(p, "2")
+	p.CooldownCredit("1", "积分不足")
+	// 把 until 拨到过去（模拟历史 state 残留到期时间）——R3 下仍不恢复
+	p.mu.Lock()
+	p.byUID["1"].until = time.Now().Add(-time.Hour)
+	p.mu.Unlock()
+	if got := p.PickExcluding(map[string]bool{"2": true}); got != nil {
+		t.Fatalf("credit-cooled account must stay cooling regardless of until: %v", got)
+	}
+	st, _ := p.Status("1")
+	if !st.Cooling {
+		t.Fatalf("status.Cooling = false after until expired, want true (R3 no expiry): %+v", st)
+	}
+	// Recover 才恢复
+	p.Recover("1")
+	if got := p.PickExcluding(map[string]bool{"2": true}); got == nil || got.UserID != "1" {
+		t.Fatalf("expected pick after Recover, got %v", got)
 	}
 }
 
@@ -251,8 +276,10 @@ func TestRecoverRestoresActive(t *testing.T) {
 	}
 }
 
-// TestCoolingUIDs 校验只返回积分冷却（CoolCredit）未禁用账号。
-// 短冷却（CoolRate/CoolErr）时间自愈，keepalive 不探测（P0-3）。
+// TestCoolingUIDs 校验返回所有积分冷却（CoolCredit）未禁用账号，不依赖 until。
+// R3：冷却无到期——只要 coolKind==CoolCredit 就返回探测（成功 Recover、失败保持冷却），
+// 到期账号（until 已过）仍必须被返回，否则既不探测又会被 healthy() 自动复活进轮转。
+// 短冷却（CoolRate/CoolErr）时间自愈，不探测（P0-3）。
 func TestCoolingUIDs(t *testing.T) {
 	p := testPool(t)
 	addAcct(p, "1")
@@ -261,9 +288,18 @@ func TestCoolingUIDs(t *testing.T) {
 	p.CooldownCredit("1", "积分不足")
 	p.Cooldown("2", CoolRate, time.Minute, ReasonSoftRate)
 	p.Disable("3", ReasonDisabled)
+	// CooldownCredit 后立即返回该账号（不再依赖 until 是否未来）
 	got := p.CoolingUIDs()
 	if len(got) != 1 || got[0] != "1" {
 		t.Fatalf("CoolingUIDs = %v, want [1] (only credit cooldown, disabled excluded)", got)
+	}
+	// 0 点边界：until 已到期（now >= until），账号仍必须被返回探测
+	p.mu.Lock()
+	p.byUID["1"].until = time.Now().Add(-time.Second)
+	p.mu.Unlock()
+	got = p.CoolingUIDs()
+	if len(got) != 1 || got[0] != "1" {
+		t.Fatalf("CoolingUIDs after until expired = %v, want [1] (still probed)", got)
 	}
 }
 
@@ -343,7 +379,8 @@ func TestStateFileNoTempResidue(t *testing.T) {
 }
 
 // TestOldStateCompat 校验旧 state.json（含 credits 字段）可加载且 credits 被忽略、
-// 旧 cool_kind=0（CoolHard）映射为 CoolCredit 语义兼容。
+// 旧 cool_kind=0（CoolHard，reason 含 credit/积分）映射为 CoolCredit 语义兼容；
+// 普通账号 cool_kind=0 且无 credit reason 保持无冷却。
 func TestOldStateCompat(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
@@ -364,7 +401,7 @@ func TestOldStateCompat(t *testing.T) {
 	kind := p.byUID["1"].coolKind
 	p.mu.RUnlock()
 	if kind != CoolCredit {
-		t.Errorf("old cool_kind=0 mapped to %v, want CoolCredit(0)", kind)
+		t.Errorf("old cool_kind=0 mapped to %v, want CoolCredit(1)", kind)
 	}
 }
 
