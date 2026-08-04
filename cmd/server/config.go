@@ -25,7 +25,7 @@ type Config struct {
 	} `json:"cooldown"`
 
 	Schedule struct {
-		KeepaliveHours []int `json:"keepalive_hours"` // 每日冷却恢复探测整点，默认 [4]
+		KeepaliveHours []int `json:"keepalive_hours"` // 每日冷却恢复探测整点，默认 [0]（中国时区 0 点）
 	} `json:"schedule"`
 
 	Upstream struct {
@@ -50,7 +50,7 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "60s"
 	c.Cooldown.ErrThresh = 5
 	c.Cooldown.ErrCooldown = "10m"
-	c.Schedule.KeepaliveHours = []int{4}
+	c.Schedule.KeepaliveHours = []int{0}
 	c.Upstream.ResponseHeaderTimeoutSeconds = 30
 	c.Upstream.TimeoutSeconds = 120
 	return c
@@ -142,7 +142,7 @@ func (c *Config) normalize() error {
 		c.Cooldown.ErrThresh = 5
 	}
 	if len(c.Schedule.KeepaliveHours) == 0 {
-		c.Schedule.KeepaliveHours = []int{4}
+		c.Schedule.KeepaliveHours = []int{0}
 	}
 	if c.Upstream.ResponseHeaderTimeoutSeconds <= 0 {
 		c.Upstream.ResponseHeaderTimeoutSeconds = 30

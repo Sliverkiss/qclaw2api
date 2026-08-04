@@ -130,18 +130,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		Stream bool `json:"stream"`
 	}
 	_ = json.Unmarshal(body, &peek)
+	// R1：上游不返回 usage，网关按请求 messages 字符数估算 prompt_tokens。
+	promptTokens := upstream.PromptTokensFromBody(body)
 
 	tried := map[string]bool{}
 	var lastErr error
+	// R2：attempted 统计实际尝试过的账号；allTransportErr 记录是否全部为传输错误。
+	// 无任何可试账号（attempted==0）或出现过 HTTP 响应 → 非模型超时。
+	attempted := 0
+	allTransportErr := true
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		acct := h.cfg.Pool.PickExcluding(tried)
 		if acct == nil {
-			break
+			break // 没有更多可试账号
 		}
 		tried[acct.UserID] = true
+		attempted++
 
 		// 本地 60rpm 令牌桶：超限换号（不触发冷却，只是跳过）
 		if !h.cfg.Pool.ReserveToken(acct.UserID) {
+			allTransportErr = false
 			lastErr = errors.New("rpm limit exceeded locally")
 			continue
 		}
@@ -152,15 +160,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(terr, context.Canceled) || r.Context().Err() != nil {
 				return
 			}
+			// R2：传输错误（上游挂起/超时/断连）是模型问题不是账号问题——
+			// 不累计 err_count，只换号重试（continue）。
 			lastErr = terr
-			h.cfg.Pool.NoteError(acct.UserID)
 			continue
 		}
+		allTransportErr = false // 已拿到上游 HTTP 响应（含 4xx/5xx），本次失败不是传输错误
 		if status >= 400 {
 			kind := upstream.Classify(status, string(respBody))
 			switch kind {
 			case upstream.ErrHardCredit:
-				// 积分不足 → 冷却至下月1号，keepalive 每日探测恢复（SPEC §2.4）
+				// 积分不足 → 冷却至次日 0 点（R3），keepalive 每日探测恢复
 				// 打印完整上游 body 便于校准 balanceMarkers 关键词（SPEC R1）
 				log.Printf("chat uid=%s: hard_credit %d body=%s",
 					acct.UserID, status, truncate(string(respBody), 200))
@@ -196,18 +206,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		defer rc.Close()
 		h.cfg.Pool.NoteSuccess(acct.UserID)
 		if peek.Stream {
-			_ = upstream.Stream(w, rc)
+			_ = upstream.Stream(w, rc, promptTokens)
 			return
 		}
 		// 非流式聚合：加总超时，上游挂死时按时返回错误（P1-5）
 		aggCtx, cancel := context.WithTimeout(r.Context(), h.cfg.AggregateTimeout)
 		defer cancel()
-		resp, err := upstream.AggregateCtx(aggCtx, rc)
+		resp, err := upstream.AggregateCtx(aggCtx, rc, promptTokens)
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	// R2：若同一请求实际尝试过账号且全部因传输错误失败 → 503 模型不可用，
+	// 且不累计任何账号 err_count（模型问题不是账号问题）。
+	if attempted > 0 && allTransportErr && lastErr != nil {
+		writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account",
+			"all accounts unavailable (model timeout): "+lastErr.Error())
 		return
 	}
 	msg := "all accounts unavailable (cooling/disabled)"

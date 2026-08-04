@@ -16,8 +16,8 @@ func TestDefault(t *testing.T) {
 	if c.Cooldown.ErrThresh != 5 {
 		t.Errorf("ErrThresh = %d, want 5", c.Cooldown.ErrThresh)
 	}
-	if len(c.Schedule.KeepaliveHours) != 1 || c.Schedule.KeepaliveHours[0] != 4 {
-		t.Errorf("KeepaliveHours = %v, want [4]", c.Schedule.KeepaliveHours)
+	if len(c.Schedule.KeepaliveHours) != 1 || c.Schedule.KeepaliveHours[0] != 0 {
+		t.Errorf("KeepaliveHours = %v, want [0] (R3)", c.Schedule.KeepaliveHours)
 	}
 	if c.Upstream.ResponseHeaderTimeoutSeconds != 30 {
 		t.Errorf("ResponseHeaderTimeoutSeconds = %d, want 30", c.Upstream.ResponseHeaderTimeoutSeconds)

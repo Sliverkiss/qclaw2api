@@ -261,17 +261,27 @@ func (p *Pool) ReserveToken(uid string) bool {
 
 // NextMonthStart 返回 now 所在月份的下月 1 号 00:00（本地时区）。
 // time.Date 自动处理跨年（12 月 → 次年 1 月）。
+// 保留仅供历史 state.json 语义参考；新 CooldownCredit 走 NextMidnight。
 func NextMonthStart(now time.Time) time.Time {
 	y, m, _ := now.Date()
 	return time.Date(y, m+1, 1, 0, 0, 0, 0, now.Location())
 }
 
-// CooldownCredit 积分不足冷却至下月 1 号 00:00，由 keepalive 每日探测恢复。
+// NextMidnight 返回 now 的次日 0 点（本地时区，容器为 Asia/Shanghai）。
+// time.Date 自动处理跨月/跨年（8-31 → 9-1，12-31 → 次年 1-1）。
+// 积分不足冷却滚动目标（R3）：每日 0 点 allow 冷却到期，keepalive 每日探测。
+func NextMidnight(now time.Time) time.Time {
+	y, m, d := now.Date()
+	return time.Date(y, m, d+1, 0, 0, 0, 0, now.Location())
+}
+
+// CooldownCredit 积分不足冷却至次日 0 点（中国时区），由 keepalive 每日探测恢复；
+// 探测失败 → 再次 CooldownCredit 滚动到再下一天 0 点（R3）。
 func (p *Pool) CooldownCredit(uid, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		e.until = NextMonthStart(time.Now())
+		e.until = NextMidnight(time.Now())
 		e.reason = reason
 		e.coolKind = CoolCredit
 		e.errCount = 0

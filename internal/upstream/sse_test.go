@@ -26,9 +26,9 @@ data: [DONE]
 
 `
 
-// TestAggregateBasic 校验流式聚合：content/reasoning_content 拼接、无 usage。
+// TestAggregateBasic 校验流式聚合：content/reasoning_content 拼接、usage 补齐（R1）。
 func TestAggregateBasic(t *testing.T) {
-	resp, err := Aggregate(strings.NewReader(sseSample))
+	resp, err := Aggregate(strings.NewReader(sseSample), 12)
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)
 	}
@@ -53,9 +53,24 @@ func TestAggregateBasic(t *testing.T) {
 	if c0["finish_reason"] != "stop" {
 		t.Errorf("finish_reason = %v", c0["finish_reason"])
 	}
-	// SPEC §1.4：非流式无 usage 字段
-	if _, ok := resp["usage"]; ok {
-		t.Errorf("usage should NOT be present (SPEC §1.4)")
+	// R1：非流式响应补 usage（上游不返回，网关估算）
+	usage, ok := resp["usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("usage should be present after R1: %v", resp["usage"])
+	}
+	if usage["prompt_tokens"] != 12 {
+		t.Errorf("prompt_tokens = %v, want 12", usage["prompt_tokens"])
+	}
+	// content "你好！" = 3 字 → 3/4 → 向上取整 1
+	if usage["completion_tokens"] != 1 {
+		t.Errorf("completion_tokens = %v, want 1", usage["completion_tokens"])
+	}
+	if usage["total_tokens"] != 13 {
+		t.Errorf("total_tokens = %v, want 13", usage["total_tokens"])
+	}
+	details, ok := usage["prompt_tokens_details"].(map[string]any)
+	if !ok || details["cached_tokens"] != 0 {
+		t.Errorf("prompt_tokens_details = %v, want cached_tokens=0", usage["prompt_tokens_details"])
 	}
 }
 
@@ -68,7 +83,7 @@ data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"
 data: [DONE]
 
 `
-	resp, err := Aggregate(strings.NewReader(sse))
+	resp, err := Aggregate(strings.NewReader(sse), 5)
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)
 	}
@@ -94,7 +109,7 @@ data: [DONE]
 
 // TestAggregateEmpty 空流 → 默认 id + 空 content。
 func TestAggregateEmpty(t *testing.T) {
-	resp, err := Aggregate(strings.NewReader(""))
+	resp, err := Aggregate(strings.NewReader(""), 3)
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)
 	}
@@ -113,7 +128,7 @@ func TestAggregateNoDone(t *testing.T) {
 	sse := `data: {"id":"msg-x","model":"m","choices":[{"delta":{"content":"part"}}]}
 
 `
-	resp, err := Aggregate(strings.NewReader(sse))
+	resp, err := Aggregate(strings.NewReader(sse), 5)
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)
 	}
@@ -124,11 +139,11 @@ func TestAggregateNoDone(t *testing.T) {
 	}
 }
 
-// TestStreamPassthrough 校验透传逐行 flush 且缺 [DONE] 补发。
+// TestStreamPassthrough 校验透传逐行 flush 且 [DONE] 前注入 usage chunk（R1）。
 func TestStreamPassthrough(t *testing.T) {
 	rec := httptest.NewRecorder()
 	w := &flusherRecorder{ResponseRecorder: rec}
-	err := Stream(w, strings.NewReader(sseSample))
+	err := Stream(w, strings.NewReader(sseSample), 8)
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
@@ -136,28 +151,98 @@ func TestStreamPassthrough(t *testing.T) {
 	for _, want := range []string{
 		`"reasoning_content":"We"`,
 		`"content":"你好！"`,
+		`"usage"`,
+		`"cached_tokens":0`,
+		`"choices":[]`,
 		`data: [DONE]`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("body missing %q", want)
 		}
 	}
+	// usage chunk 必须在 [DONE] 之前（OpenAI 标准）
+	usageIdx := strings.Index(body, `"usage"`)
+	doneIdx := strings.Index(body, "data: [DONE]")
+	if usageIdx < 0 || doneIdx < 0 || usageIdx > doneIdx {
+		t.Errorf("usage chunk must appear before [DONE] (usage@%d done@%d)", usageIdx, doneIdx)
+	}
 	if rec.Header().Get("Content-Type") != "text/event-stream" {
 		t.Errorf("Content-Type = %q", rec.Header().Get("Content-Type"))
 	}
 }
 
-// TestStreamMissingDone 缺 [DONE] 时补发。
+// TestStreamMissingDone 缺 [DONE] 时补发（含 usage chunk）。
 func TestStreamMissingDone(t *testing.T) {
 	rec := httptest.NewRecorder()
 	w := &flusherRecorder{ResponseRecorder: rec}
-	err := Stream(w, strings.NewReader(`data: {"id":"x"}`+"\n\n"))
+	err := Stream(w, strings.NewReader(`data: {"id":"x"}`+"\n\n"), 4)
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
 	body := rec.Body.String()
 	if !strings.Contains(body, "data: [DONE]") {
 		t.Errorf("missing appended [DONE]: %q", body)
+	}
+	if !strings.Contains(body, `"usage"`) {
+		t.Errorf("missing usage chunk before [DONE]: %q", body)
+	}
+}
+
+// TestUsageEstimate 校验字符数/4 估算（向上取整、至少 1）。
+func TestUsageEstimate(t *testing.T) {
+	cases := []struct {
+		chars int
+		want  int
+	}{
+		{0, 1},  // 空/未知 → 1，避免 0 被视为未调用
+		{-5, 1}, // 负数 → 1
+		{1, 1},
+		{3, 1},
+		{4, 1},
+		{5, 2},
+		{8, 2},
+		{9, 3},
+	}
+	for _, c := range cases {
+		if got := usageTokenEstimate(c.chars); got != c.want {
+			t.Errorf("usageTokenEstimate(%d) = %d, want %d", c.chars, got, c.want)
+		}
+	}
+}
+
+// TestPromptTokensFromBody 校验从请求 body 估算 prompt_tokens。
+func TestPromptTokensFromBody(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want int
+	}{
+		{"多轮字符串 content", `{"messages":[{"role":"user","content":"你好"},{"role":"assistant","content":"world"}]}`, 2},
+		{"数组 content", `{"messages":[{"role":"user","content":[{"type":"text","text":"abcdefgh"}]}]}`, 2},
+		{"无 messages", `{"model":"m"}`, 1},
+		{"坏 JSON", `{broken`, 1},
+		{"空 content", `{"messages":[{"role":"user","content":""}]}`, 1},
+	}
+	for _, c := range cases {
+		if got := PromptTokensFromBody([]byte(c.body)); got != c.want {
+			t.Errorf("%s: PromptTokensFromBody = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// TestStreamPreservesUpstreamUsage 校验上游若自带 usage chunk 则不重复注入。
+func TestStreamPreservesUpstreamUsage(t *testing.T) {
+	upstreamUsage := `data: {"id":"x","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`
+	sse := upstreamUsage + "\n\ndata: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	w := &flusherRecorder{ResponseRecorder: rec}
+	if err := Stream(w, strings.NewReader(sse), 5); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	body := rec.Body.String()
+	// 只应出现一次 usage（上游自带，不注入第二份）
+	if n := strings.Count(body, `"usage"`); n != 1 {
+		t.Errorf("usage occurrences = %d, want 1 (dedupe)", n)
 	}
 }
 
@@ -200,7 +285,7 @@ func TestClassify(t *testing.T) {
 
 // TestJSONMarshalAggregate 校验聚合结果可 JSON 序列化（server 响应用）。
 func TestJSONMarshalAggregate(t *testing.T) {
-	resp, err := Aggregate(strings.NewReader(sseSample))
+	resp, err := Aggregate(strings.NewReader(sseSample), 10)
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)
 	}
@@ -209,11 +294,11 @@ func TestJSONMarshalAggregate(t *testing.T) {
 	}
 }
 
-// TestAggregateNonStreamJSON 校验 stream:false 纯 JSON 响应（无 data: 前缀）直接透传。
-// 复现真实上游形态（SPEC §1.4 实测非流式响应）——无 usage、message 含 content/reasoning_content。
+// TestAggregateNonStreamJSON 校验 stream:false 纯 JSON 响应（无 data: 前缀）直接透传，
+// 并按 R1 补齐 usage。
 func TestAggregateNonStreamJSON(t *testing.T) {
 	raw := `{"id":"msg-abc","object":"chat.completion","created":1783000000,"model":"pool-deepseek-v4-flash","choices":[{"index":0,"message":{"role":"assistant","content":"5+5等于10。","reasoning_content":"先算5+5"},"finish_reason":"stop"}]}`
-	resp, err := Aggregate(strings.NewReader(raw))
+	resp, err := Aggregate(strings.NewReader(raw), 20)
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)
 	}
@@ -238,16 +323,31 @@ func TestAggregateNonStreamJSON(t *testing.T) {
 	if c0["finish_reason"] != "stop" {
 		t.Errorf("finish_reason = %v", c0["finish_reason"])
 	}
-	// SPEC §1.4：非流式无 usage 字段
-	if _, ok := resp["usage"]; ok {
-		t.Errorf("usage should NOT be present (SPEC §1.4)")
+	// R1：非流式纯 JSON 响应补 usage
+	usage, ok := resp["usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("usage should be present after R1: %v", resp["usage"])
+	}
+	if usage["prompt_tokens"] != 20 {
+		t.Errorf("prompt_tokens = %v, want 20", usage["prompt_tokens"])
+	}
+	// content "5+5等于10。" = 7 字 → 7/4 → 2
+	if usage["completion_tokens"] != 2 {
+		t.Errorf("completion_tokens = %v, want 2", usage["completion_tokens"])
+	}
+	if usage["total_tokens"] != 22 {
+		t.Errorf("total_tokens = %v, want 22", usage["total_tokens"])
+	}
+	details, ok := usage["prompt_tokens_details"].(map[string]any)
+	if !ok || details["cached_tokens"] != 0 {
+		t.Errorf("prompt_tokens_details = %v, want cached_tokens=0", usage["prompt_tokens_details"])
 	}
 }
 
 // TestAggregateNonStreamMissingFields 校验纯 JSON 缺 role/finish_reason/object 时归一化补齐。
 func TestAggregateNonStreamMissingFields(t *testing.T) {
 	raw := `{"choices":[{"message":{"content":"hi"}}]}`
-	resp, err := Aggregate(strings.NewReader(raw))
+	resp, err := Aggregate(strings.NewReader(raw), 3)
 	if err != nil {
 		t.Fatalf("Aggregate: %v", err)
 	}
@@ -274,7 +374,7 @@ func TestAggregateCtxTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := AggregateCtx(ctx, pr)
+	_, err := AggregateCtx(ctx, pr, 5)
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}

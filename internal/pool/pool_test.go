@@ -144,7 +144,7 @@ func TestDisable(t *testing.T) {
 	}
 }
 
-// TestCooldownCredit 校验积分冷却 until = 下月1号 00:00，且状态类型为 CoolCredit。
+// TestCooldownCredit 校验积分冷却 until = 次日 0 点（R3），且状态类型为 CoolCredit。
 func TestCooldownCredit(t *testing.T) {
 	p := testPool(t)
 	addAcct(p, "1")
@@ -156,9 +156,9 @@ func TestCooldownCredit(t *testing.T) {
 	if st.Reason != "积分不足" {
 		t.Errorf("reason = %q", st.Reason)
 	}
-	want := NextMonthStart(time.Now())
+	want := NextMidnight(time.Now())
 	if !st.Until.Equal(want) {
-		t.Errorf("until = %v, want NextMonthStart=%v", st.Until, want)
+		t.Errorf("until = %v, want NextMidnight=%v", st.Until, want)
 	}
 	// 冷却中不可选
 	if got := p.Pick(); got != nil {
@@ -169,6 +169,24 @@ func TestCooldownCredit(t *testing.T) {
 	p.mu.RUnlock()
 	if kind != CoolCredit {
 		t.Errorf("coolKind = %v, want CoolCredit(%d)", kind, CoolCredit)
+	}
+}
+
+// TestNextMidnight 校验次日 0 点（跨月/跨年边界，R3）。
+func TestNextMidnight(t *testing.T) {
+	cases := []struct {
+		in   time.Time
+		want time.Time
+	}{
+		{time.Date(2026, 8, 4, 23, 59, 59, 0, time.Local), time.Date(2026, 8, 5, 0, 0, 0, 0, time.Local)},
+		{time.Date(2026, 8, 31, 15, 30, 0, 0, time.Local), time.Date(2026, 9, 1, 0, 0, 0, 0, time.Local)},
+		{time.Date(2026, 12, 31, 23, 0, 0, 0, time.Local), time.Date(2027, 1, 1, 0, 0, 0, 0, time.Local)},
+		{time.Date(2026, 2, 28, 10, 0, 0, 0, time.Local), time.Date(2026, 3, 1, 0, 0, 0, 0, time.Local)},
+	}
+	for _, c := range cases {
+		if got := NextMidnight(c.in); !got.Equal(c.want) {
+			t.Errorf("NextMidnight(%v) = %v, want %v", c.in, got, c.want)
+		}
 	}
 }
 

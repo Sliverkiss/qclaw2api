@@ -17,7 +17,8 @@ import (
 //	嵌套形 {"auth":{...},"account":{...}}   （cmd/login 落盘）
 //	扁平形 {"jwt_token":...,"user_id":...}  （手建兼容）
 type Auth struct {
-	// mu 串行化 refresh 写与 SaveAtomic 读，防止并发写回半更新。
+	// mu 串行化 JWT 捕获写（login 时 X-New-Token）与 SaveAtomic 读，防止并发写回半更新。
+	// 运行期无 token refresh，对话只用 SKAPIKey；JWT 仅在 login 流程被 X-New-Token 覆盖写回。
 	mu sync.Mutex
 
 	JWTToken     string // jprx 登录态（X-OpenClaw-Token），4026 返回 token
@@ -27,7 +28,7 @@ type Auth struct {
 	Nickname     string // 昵称
 	GUID         string // qclawmp_<uuid>，签名/风控兜底
 	ExpiresAt    int64  // Unix 秒，4026 expires_in=2592000 → now+30天
-	FilePath     string // 来源文件；refresh 后原子写回此处
+	FilePath     string // 来源文件；JWT 捕获后原子写回此处
 }
 
 // Lock 供同进程内其他包（jprx X-New-Token 捕获）在改写字段期间加锁。
@@ -110,7 +111,7 @@ func Parse(raw []byte) (*Auth, error) {
 }
 
 // SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename 0600）。
-// 加锁外壳：防止与 refresh 并发读写字段导致写回半更新。
+// 加锁外壳：防止与 JWT 捕获（X-New-Token 覆盖）并发读写字段导致写回半更新。
 func (a *Auth) SaveAtomic() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()

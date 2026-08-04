@@ -10,7 +10,7 @@
     "err_cooldown": "10m"
   },
   "schedule": {
-    "keepalive_hours": [4]
+    "keepalive_hours": [0]
   },
   "upstream": {
     "response_header_timeout_seconds": 30,

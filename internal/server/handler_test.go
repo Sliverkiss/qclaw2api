@@ -384,6 +384,60 @@ func TestEmbeddingsNotFound(t *testing.T) {
 	}
 }
 
+// TestChatTransportErrorNotCounted 校验传输错误不累计 err_count（R2）：
+// 上游对每个账号都连接失败/超时（transport error）→ 不 NoteError，账号 err_count 保持 0，
+// 最终 503 且文案带 "model timeout"（模型问题而非账号问题）。
+func TestChatTransportErrorNotCounted(t *testing.T) {
+	// 关闭的 httptest server：连接立即被拒 → transport error（而非 4xx/5xx）。
+	aizSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := aizSrv.URL
+	aizSrv.Close()
+
+	p := pool.New("", pool.Config{RPM: 60, ErrThreshold: 5, ErrCooldown: 10 * time.Minute})
+	p.Add(mkAuth("1"))
+	p.Add(mkAuth("2"))
+
+	up := upstream.New()
+	up.SetChatURL(url + "/chat")
+
+	h := NewHandler(Config{Pool: p, Upstream: up, APIKey: testAPIKey, MaxRotate: 3})
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":false}`))
+	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	msg, _ := out["error"].(map[string]any)["message"].(string)
+	if !strings.Contains(msg, "model timeout") {
+		t.Errorf("503 message should mention model timeout (R2), got %q", msg)
+	}
+
+	// R2：传输错误不累计 err_count（账号未因模型超时受罚）
+	for _, uid := range []string{"1", "2"} {
+		st, ok := p.Status(uid)
+		if !ok {
+			t.Fatalf("status for %s missing", uid)
+		}
+		if st.ErrCount != 0 {
+			t.Errorf("uid=%s ErrCount = %d, want 0 (transport error must not penalize account)", uid, st.ErrCount)
+		}
+		if st.Cooling || st.Disabled {
+			t.Errorf("uid=%s should neither be cooled nor disabled: %+v", uid, st)
+		}
+	}
+}
+
 // TestChatClientDisconnectNotCounted 校验客户端断开（ctx 取消）不计账号错误（P1-4）。
 // 直接构造已取消 ctx 的请求调用 chatCompletions：ChatStream 用该 ctx 发请求，
 // chatHTTP.Do 立即返回 context.Canceled → handler 应直接 return，不 NoteError、不冷却账号。
