@@ -17,3 +17,4 @@ __pycache__/
 # 编辑器
 .idea/
 .vscode/
+AGENTS.md
